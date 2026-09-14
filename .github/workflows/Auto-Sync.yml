@@ -1,0 +1,115 @@
+name: Auto Sync Upstream & Workflow Mod
+
+on:
+  schedule:
+    - cron: '30 21 * * *'
+  workflow_dispatch:
+
+permissions: write-all
+
+jobs:
+  sync_and_modify:
+    runs-on: ubuntu-latest
+    name: Automated Sync and Strict Workflow Trimming
+
+    steps:
+    - name: Checkout target repo with PAT
+      uses: actions/checkout@v4
+      with:
+        ref: main
+        token: ${{ secrets.PAT_TOKEN }}
+        persist-credentials: true
+        fetch-depth: 0
+
+    - name: Fetch and Force Sync Upstream
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        
+        mkdir -p /tmp/wf_backup
+        cp -f .github/workflows/Auto-Sync*.yml /tmp/wf_backup/ 2>/dev/null || true
+        cp -f .github/workflows/ZN-M2*.yml /tmp/wf_backup/ 2>/dev/null || true
+        cp -f Config/ZN-M2-WIRED.txt /tmp/wf_backup/ 2>/dev/null || true        
+        cp -f Scripts/patch_homeproxy.sh /tmp/wf_backup/ 2>/dev/null || true
+        
+        git remote add upstream https://github.com/VIKINGYFY/OpenWRT-CI.git || true
+        git fetch upstream main
+        git reset --hard upstream/main
+
+        mkdir -p .github/workflows Config
+        cp -f /tmp/wf_backup/*.yml .github/workflows/ 2>/dev/null || true
+        cp -f /tmp/wf_backup/*.txt Config/ 2>/dev/null || true
+        cp -f /tmp/wf_backup/*.sh Scripts/ 2>/dev/null || true
+        
+    - name: Force Modify Downloaded Workflows & Scripts
+      run: |
+        if [ -f "Scripts/Packages.sh" ]; then
+          sed -i 's|UPDATE_PACKAGE "timecontrol" "sirpdboy/luci-app-timecontrol" "main"|UPDATE_PACKAGE "timecontrol" "gaobin89/luci-app-timecontrol" "js"|g' Scripts/Packages.sh
+          
+          if ! grep -qF "laipeng668/luci-app-gecoosac" Scripts/Packages.sh; then
+            echo '' >> Scripts/Packages.sh
+            # 删 viking 旧版，拉取 laipeng668 新版
+            echo 'find . -maxdepth 4 -type d \( -name "*gecoosac*" \) -exec rm -rf {} +' >> Scripts/Packages.sh
+            echo 'UPDATE_PACKAGE "luci-app-gecoosac" "laipeng668/luci-app-gecoosac" "main" "" "gecoosac luci-app-gecoosac"' >> Scripts/Packages.sh
+            
+            if ! grep -q "^mkdir -p files/etc$" Scripts/Packages.sh; then 
+              echo '' >> Scripts/Packages.sh
+              echo 'mkdir -p files/etc' >> Scripts/Packages.sh 
+              echo 'touch files/etc/sysupgrade.conf' >> Scripts/Packages.sh 
+              #echo 'echo "/etc/homeproxy/private_srs" >> files/etc/sysupgrade.conf' >> Scripts/Packages.sh 
+              echo 'chmod 644 files/etc/sysupgrade.conf' >> Scripts/Packages.sh
+            fi
+            echo '#引入私有扩展脚本' >> Scripts/Packages.sh
+            echo 'if [ -f "$GITHUB_WORKSPACE/Scripts/PRIVATE.sh" ]; then' >> Scripts/Packages.sh
+            echo '	source "$GITHUB_WORKSPACE/Scripts/PRIVATE.sh"' >> Scripts/Packages.sh
+            echo 'fi' >> Scripts/Packages.sh
+          fi
+        fi
+
+        # 直接调用写好的外部脚本，彻底解决 YAML 引号和括号嵌套冲突 已无自定义模式，弃用。
+        #if [ -f "Scripts/Handles.sh" ] && [ -f "Scripts/patch_homeproxy.sh" ]; then
+        #  bash "Scripts/patch_homeproxy.sh"
+        #fi
+
+        [ -f ".github/workflows/MTK-ALL.yml" ] && sed -i '/workflow_run:/,/completed/ {s/^/#/}' .github/workflows/MTK-ALL.yml
+        [ -f ".github/workflows/QCA-ALL.yml" ] && sed -i '/workflow_run:/,/completed/ {s/^/#/}' .github/workflows/QCA-ALL.yml        
+        [ -f ".github/workflows/QCB-ALL.yml" ] && sed -i '/workflow_run:/,/completed/ {s/^/#/}' .github/workflows/QCB-ALL.yml 
+        [ -f ".github/workflows/OWRT-ALL.yml" ] && sed -i 's/CONFIG: \[.*\]/CONFIG: [X86]/g' .github/workflows/OWRT-ALL.yml
+        
+    - name: Patch dockerd Makefile to skip missing nested executables
+      run: |
+        FILE="feeds/packages/utils/dockerd/Makefile"
+        if [ -f "$FILE" ]; then
+          OLD_PATTERN='cp \$(BUNDLED_BINARIES) bundles/binary-daemon/'
+          NEW_PATTERN='for f in \$(BUNDLED_BINARIES); do [ -n "\$\$f" ] \&\& [ -f "\$\$f" ] \&\& cp "\$\$f" bundles/binary-daemon/ || echo "Skipping missing executable: \$\$f"; done'
+          if grep -q 'cp \$(BUNDLED_BINARIES) bundles/binary-daemon/' "$FILE"; then
+            sed -i "s|${OLD_PATTERN}|${NEW_PATTERN}|g" "$FILE"
+          fi
+        fi
+
+    - name: Apply General Common Packages
+      run: |
+        ENABLE_PKGS=(
+          "conntrack" "tcpdump" "tree" "bash" "curl" "ip-full"
+          "ddns-scripts-services" "ddns-scripts" "luci-app-ddns"
+          "luci-app-timecontrol" "luci-app-cpufreq" "ttyd" "luci-app-ttyd"
+          "luci-i18n-ttyd-zh-cn" "kmod-nft-tproxy" "ca-bundle" "kmod-tun" "libldns" "drill"
+        )
+        PRIVATE_FILE="Config/PRIVATE.txt"
+        mkdir -p "$(dirname "$PRIVATE_FILE")"
+        touch "$PRIVATE_FILE"
+
+        for pkg in "${ENABLE_PKGS[@]}"; do
+          key="CONFIG_PACKAGE_${pkg}"
+          sed -i "/^# ${key} is not set/d; /^${key}=.*/d" "$PRIVATE_FILE" || true
+          echo "${key}=y" >> "$PRIVATE_FILE"
+        done
+        echo "Sync updated at $(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" > README.md
+        
+    - name: Push Synced & Modified Changes
+      run: |
+        if [ -n "$(git status --porcelain)" ]; then
+          git add .
+          git commit -m "⚙️ Auto Sync: Workflows trimmed"
+          git push --force origin main
+        fi
