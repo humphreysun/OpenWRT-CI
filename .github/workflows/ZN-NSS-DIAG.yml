@@ -1,0 +1,396 @@
+
+name: ZN-M2 NSS QDISC Diagnostic
+/***
+on:
+  workflow_dispatch:
+    inputs:
+      WRT_CONFIG:
+        description: "Config file name"
+        required: true
+        default: "ZN-M2-WIRED"
+        type: string
+
+      WRT_REPO:
+        description: "OpenWrt source repository"
+        required: true
+        default: "https://github.com/VIKINGYFY/immortalwrt"
+        type: string
+
+      WRT_BRANCH:
+        description: "OpenWrt source branch"
+        required: true
+        default: "main"
+        type: string
+
+      WRT_SOURCE:
+        description: "Source label"
+        required: true
+        default: "VIKINGYFY"
+        type: string
+
+
+env:
+  WRT_CONFIG: ${{ inputs.WRT_CONFIG }}
+  WRT_REPO: ${{ inputs.WRT_REPO }}
+  WRT_BRANCH: ${{ inputs.WRT_BRANCH }}
+  WRT_SOURCE: ${{ inputs.WRT_SOURCE }}
+
+
+jobs:
+  nss-diagnostic:
+    name: NSS QDISC Diagnostic
+    runs-on: ubuntu-24.04
+
+    steps:
+
+      # ---------------------------------------------------------
+      # 1. Checkout user's repository
+      # ---------------------------------------------------------
+      - name: Checkout Projects
+        uses: actions/checkout@main
+
+
+      # ---------------------------------------------------------
+      # 2. Initialize build environment
+      # ---------------------------------------------------------
+      - name: Initialization Environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt -yqq update
+          sudo -E apt -yqq install dos2unix libfuse-dev
+
+          sudo bash -c \
+            'bash <(curl -sL https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+
+          sudo -E systemctl daemon-reload
+          sudo -E timedatectl set-timezone "Asia/Shanghai"
+
+          sudo mkdir -p /mnt/build_wrt
+          sudo chown "$USER:$USER" /mnt/build_wrt
+
+          sudo ln -s /mnt/build_wrt "$GITHUB_WORKSPACE/wrt"
+
+
+      # ---------------------------------------------------------
+      # 3. Read target information
+      # ---------------------------------------------------------
+      - name: Initialization Values
+        run: |
+          set -Eeuo pipefail
+
+          CONFIG_FILE="./Config/$WRT_CONFIG.txt"
+
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "ERROR: config file not found:"
+            echo "$CONFIG_FILE"
+            exit 1
+          fi
+
+          WRT_TARGET=$(grep -m 1 -oP \
+            '^CONFIG_TARGET_\K[\w]+(?=\=y)' "$CONFIG_FILE")
+
+          WRT_SUBTARGET=$(grep -m 1 -oP \
+            "^CONFIG_TARGET_${WRT_TARGET}_\K[\w]+(?=\=y)" "$CONFIG_FILE")
+
+          echo "WRT_TARGET=$WRT_TARGET" >> "$GITHUB_ENV"
+          echo "WRT_SUBTARGET=$WRT_SUBTARGET" >> "$GITHUB_ENV"
+
+          echo
+          echo "============================================================"
+          echo " Build target information"
+          echo "============================================================"
+          echo "WRT_CONFIG    = $WRT_CONFIG"
+          echo "WRT_REPO      = $WRT_REPO"
+          echo "WRT_BRANCH    = $WRT_BRANCH"
+          echo "WRT_SOURCE    = $WRT_SOURCE"
+          echo "WRT_TARGET    = $WRT_TARGET"
+          echo "WRT_SUBTARGET = $WRT_SUBTARGET"
+          echo "============================================================"
+
+
+      # ---------------------------------------------------------
+      # 4. Clone OpenWrt source
+      # ---------------------------------------------------------
+      - name: Clone Code
+        run: |
+          set -Eeuo pipefail
+
+          git clone \
+            --depth=1 \
+            --single-branch \
+            --branch "$WRT_BRANCH" \
+            "$WRT_REPO" \
+            ./wrt/
+
+          cd ./wrt/
+
+          WRT_HASH=$(git rev-parse HEAD)
+
+          echo "WRT_HASH=$WRT_HASH" >> "$GITHUB_ENV"
+
+          echo
+          echo "============================================================"
+          echo " OpenWrt source"
+          echo "============================================================"
+          echo "Repository : $WRT_REPO"
+          echo "Branch     : $WRT_BRANCH"
+          echo "Commit     : $WRT_HASH"
+          echo "============================================================"
+
+
+      # ---------------------------------------------------------
+      # 5. Normalize scripts
+      # ---------------------------------------------------------
+      - name: Check Scripts
+        run: |
+          find ./ -maxdepth 3 -type f \
+            -iregex ".*\(txt\|sh\)$" \
+            -exec dos2unix {} \; \
+            -exec chmod +x {} \;
+
+
+      # ---------------------------------------------------------
+      # 6. Update feeds
+      # ---------------------------------------------------------
+      - name: Update Feeds
+        run: |
+          set -Eeuo pipefail
+
+          cd ./wrt/
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+
+      # ---------------------------------------------------------
+      # 7. Apply user's package modifications
+      # ---------------------------------------------------------
+      - name: Custom Packages
+        run: |
+          set -Eeuo pipefail
+
+          cd ./wrt/
+
+          "$GITHUB_WORKSPACE/Scripts/ZN-Packages.sh"
+          "$GITHUB_WORKSPACE/Scripts/Handles.sh"
+
+
+      # ---------------------------------------------------------
+      # 8. Apply user's configuration
+      # ---------------------------------------------------------
+      - name: Custom Settings
+        run: |
+          set -Eeuo pipefail
+
+          cd ./wrt/
+
+          cat \
+            "$GITHUB_WORKSPACE/Config/$WRT_CONFIG.txt" \
+            "$GITHUB_WORKSPACE/Config/ZN-GENERAL.txt" \
+            >> .config
+
+          "$GITHUB_WORKSPACE/Scripts/ZN-Settings.sh"
+
+          make defconfig -j"$(nproc)"
+
+          "$GITHUB_WORKSPACE/Scripts/ZN-FINAL-CONFIG.sh"
+
+
+      # =========================================================
+      # 9. NSS QDISC DIAGNOSTIC
+      # =========================================================
+      - name: NSS QDISC Diagnostic
+        run: |
+          set -Eeuo pipefail
+
+          cd ./wrt/
+
+          echo
+          echo "############################################################"
+          echo "# ZN-M2 NSS QDISC DIAGNOSTIC"
+          echo "############################################################"
+
+
+          echo
+          echo "============================================================"
+          echo "1. SOURCE REVISION"
+          echo "============================================================"
+
+          git rev-parse HEAD
+          git log -1 --oneline
+
+
+          echo
+          echo "============================================================"
+          echo "2. NSS QDISC SOURCE FILES"
+          echo "============================================================"
+
+          find package feeds \
+            -type f \
+            \( \
+              -name 'q_nss.c' \
+              -o -name '*nss*qdisc*' \
+              -o -name '*nss*shaper*' \
+            \) \
+            2>/dev/null \
+            | sort || true
+
+
+          echo
+          echo "============================================================"
+          echo "3. NSS QDISC SOURCE SYMBOLS"
+          echo "============================================================"
+
+          grep -RniE \
+            'nsstbl|nssfq_codel|nsscodel|nsspfifo|nssbfifo|nssred|nsswred|nssprio|nssmirred' \
+            package feeds \
+            2>/dev/null \
+            | head -500 || true
+
+
+          echo
+          echo "============================================================"
+          echo "4. NSS QDISC PARAMETERS"
+          echo "============================================================"
+
+          grep -RniE \
+            'accel_mode|set_default|NSS_QDISC|qdisc.*NSS' \
+            package feeds \
+            2>/dev/null \
+            | head -500 || true
+
+
+          echo
+          echo "============================================================"
+          echo "5. qca-nss-drv-qdisc PACKAGE"
+          echo "============================================================"
+
+          grep -RniE \
+            'qca-nss-drv-qdisc|qca_nss_qdisc' \
+            package feeds \
+            2>/dev/null \
+            | head -300 || true
+
+
+          echo
+          echo "============================================================"
+          echo "6. IGS / INGRESS SHAPING"
+          echo "============================================================"
+
+          grep -RniE \
+            'qca-nss-drv-igs|NSS_DRV_IGS|CONFIG.*IGS|igs' \
+            package feeds \
+            2>/dev/null \
+            | head -500 || true
+
+
+          echo
+          echo "============================================================"
+          echo "7. IFB / MIRRED SUPPORT"
+          echo "============================================================"
+
+          grep -RniE \
+            'kmod-ifb|act_nssmirred|nssmirred|ifb' \
+            package feeds \
+            2>/dev/null \
+            | head -500 || true
+
+
+          echo
+          echo "============================================================"
+          echo "8. FINAL .CONFIG — NSS"
+          echo "============================================================"
+
+          grep -E \
+            'CONFIG_(PACKAGE_)?kmod-qca-nss-drv(-qdisc|-igs)?=' \
+            .config \
+            2>/dev/null \
+            || true
+
+          grep -E \
+            'CONFIG_(PACKAGE_)?(kmod-ifb|tc-full|sqm-scripts|luci-app-sqm)=' \
+            .config \
+            2>/dev/null \
+            || true
+
+
+          echo
+          echo "============================================================"
+          echo "9. FINAL .CONFIG — NSS KERNEL OPTIONS"
+          echo "============================================================"
+
+          grep -E \
+            'CONFIG_NSS.*(QDISC|SHAPER|IGS)|CONFIG_.*NSS.*(QDISC|SHAPER|IGS)' \
+            .config \
+            2>/dev/null \
+            || true
+
+
+          echo
+          echo "============================================================"
+          echo "10. NSS PACKAGE MAKEFILES"
+          echo "============================================================"
+
+          find package feeds \
+            -type f \
+            \( -name 'Makefile' -o -name '*.mk' \) \
+            -print0 2>/dev/null \
+            | xargs -0 grep -l \
+              'qca-nss-drv-qdisc\|qca_nss_qdisc' \
+              2>/dev/null \
+            | sort -u \
+            | head -100 || true
+
+
+          echo
+          echo "============================================================"
+          echo "11. NSS PATCHES"
+          echo "============================================================"
+
+          find package feeds \
+            -type f \
+            \( -name '*.patch' -o -name '*.diff' \) \
+            -print0 2>/dev/null \
+            | xargs -0 grep -li \
+              'nss.*qdisc\|qca_nss_qdisc\|nssmirred' \
+              2>/dev/null \
+            | sort -u \
+            | head -200 || true
+
+
+          echo
+          echo "============================================================"
+          echo "12. BUILD TREE — qca-nss"
+          echo "============================================================"
+
+          find package \
+            -maxdepth 4 \
+            -type d \
+            -iname '*qca*nss*' \
+            2>/dev/null \
+            | sort || true
+
+
+          echo
+          echo "============================================================"
+          echo "13. NSS QDISC SUMMARY"
+          echo "============================================================"
+
+          echo "Target    : $WRT_TARGET"
+          echo "Subtarget : $WRT_SUBTARGET"
+          echo "Config    : $WRT_CONFIG"
+          echo "Commit    : $WRT_HASH"
+
+          echo
+          echo "NSS-related selected config:"
+          grep -E \
+            'CONFIG_PACKAGE_kmod-qca-nss|CONFIG_NSS_.*(QDISC|SHAPER|IGS)' \
+            .config \
+            2>/dev/null \
+            | sort || true
+
+          echo
+          echo "############################################################"
+          echo "# NSS QDISC DIAGNOSTIC END"
+          echo "############################################################"
