@@ -55,47 +55,130 @@ UPDATE_PACKAGE "noobwrt" "nooblk-98/luci-theme-noobwrt" "master"
 UPDATE_PACKAGE "shadcn" "eamonxg/luci-theme-shadcn" "main"
 UPDATE_PACKAGE "theme-fluent" "LazuliKao/luci-theme-fluent" "main"
 
-UPDATE_PACKAGE "momo" "nikkinikki-org/OpenWrt-momo" "main"
-UPDATE_PACKAGE "nikki" "nikkinikki-org/OpenWrt-nikki" "main"
-UPDATE_PACKAGE "openclash" "vernesong/OpenClash" "dev" "pkg"
-UPDATE_PACKAGE "passwall" "Openwrt-Passwall/openwrt-passwall" "main" "pkg"
-UPDATE_PACKAGE "passwall2" "Openwrt-Passwall/openwrt-passwall2" "main" "pkg"
+#UPDATE_PACKAGE "momo" "nikkinikki-org/OpenWrt-momo" "main"
+#UPDATE_PACKAGE "nikki" "nikkinikki-org/OpenWrt-nikki" "main"
+#UPDATE_PACKAGE "openclash" "vernesong/OpenClash" "dev" "pkg"
+#UPDATE_PACKAGE "passwall" "Openwrt-Passwall/openwrt-passwall" "main" "pkg"
+#UPDATE_PACKAGE "passwall2" "Openwrt-Passwall/openwrt-passwall2" "main" "pkg"
 
-UPDATE_PACKAGE "diskmanager" "4IceG/luci-app-mini-diskmanager" "main"
-UPDATE_PACKAGE "easytier" "EasyTier/luci-app-easytier" "main"
-UPDATE_PACKAGE "qmodem" "FUjr/QModem" "main"
+#UPDATE_PACKAGE "diskmanager" "4IceG/luci-app-mini-diskmanager" "main"
+#UPDATE_PACKAGE "easytier" "EasyTier/luci-app-easytier" "main"
+#UPDATE_PACKAGE "qmodem" "FUjr/QModem" "main"
 
 #UPDATE_PACKAGE "viking" "VIKINGYFY/packages" "main" "" "axonhub gecoosac sing-box luci-app-homeproxy luci-app-timewol luci-app-wolplus luci-app-wolultra"
-# VIKINGYFY/packages 中的 HomeProxy / sing-box 不使用，改用官方版本
-find ./package/packages -maxdepth 3 -type d \( \
-    -name "luci-app-homeproxy" -o \
-    -name "sing-box" \
-    -name "gecoosac" \
-\) -print -exec rm -rf {} +
+
+# ============================================================
+# 通用文件下载函数
+# 用法：
+#   DOWNLOAD_FILE "源URL" "目标文件"
+# ============================================================
+
+DOWNLOAD_FILE() {
+    local URL="$1"
+    local DEST="$2"
+
+    echo "[Download] $URL"
+    echo "[Download] -> $DEST"
+
+    mkdir -p "$(dirname "$DEST")"
+
+    if ! curl -fL --retry 3 --retry-delay 2 \
+        -o "$DEST" \
+        "$URL"
+    then
+        echo "[ERROR] Download failed:"
+        echo "$URL"
+        exit 1
+    fi
+
+    if [ ! -s "$DEST" ]; then
+        echo "[ERROR] Downloaded file is empty:"
+        echo "$DEST"
+        exit 1
+    fi
+}
+
+# ============================================================
+# VIKINGYFY 最新 sing-box
+# 只下载 sing-box package，不引入其他 VIKINGYFY packages
+# ============================================================
+
+echo "[ZN-Packages] Importing VIKINGYFY sing-box..."
+rm -rf ./package/sing-box
+
+# 删除 feeds 中官方 sing-box，避免重复
+find ./feeds/packages -maxdepth 3 -type d -name "sing-box" \
+    -print -exec rm -rf {} +
+
+SINGBOX_PATH="./package/sing-box"
+SINGBOX_BASE="https://raw.githubusercontent.com/VIKINGYFY/packages/main/sing-box"
+
+mkdir -p \
+    "$SINGBOX_PATH/files" \
+    "$SINGBOX_PATH/patches"
+
+DOWNLOAD_FILE \
+    "$SINGBOX_BASE/Makefile" \
+    "$SINGBOX_PATH/Makefile"
+
+DOWNLOAD_FILE \
+    "$SINGBOX_BASE/files/sing-box.conf" \
+    "$SINGBOX_PATH/files/sing-box.conf"
+
+DOWNLOAD_FILE \
+    "$SINGBOX_BASE/files/sing-box.init" \
+    "$SINGBOX_PATH/files/sing-box.init"
+
+DOWNLOAD_FILE \
+    "$SINGBOX_BASE/patches/100-fix-dns-tcp-close.patch" \
+    "$SINGBOX_PATH/patches/100-fix-dns-tcp-close.patch"
+
+echo "[ZN-Packages] VIKINGYFY sing-box imported."
+
+grep -E '^(PKG_NAME|PKG_UPSTREAM_VERSION|PKG_VERSION|PKG_RELEASE):=' \
+    "$SINGBOX_PATH/Makefile"
+
+echo "[ZN-Packages] sing-box package files:"
+find "$SINGBOX_PATH" -type f
+echo "[ZN-Packages] VIKINGYFY sing-box imported."
+
 # 官方 HomeProxy
 UPDATE_PACKAGE "homeproxy" "immortalwrt/homeproxy" "master"
 
-UPDATE_PACKAGE "vnt" "lmq8267/luci-app-vnt" "main"
+#UPDATE_PACKAGE "vnt" "lmq8267/luci-app-vnt" "main"
 
-UPDATE_PACKAGE "diskman" "sbwml/luci-app-diskman" "main"
-UPDATE_PACKAGE "mosdns" "sbwml/luci-app-mosdns" "v5" "" "v2dat"
-UPDATE_PACKAGE "openlist2" "sbwml/luci-app-openlist2" "main"
-UPDATE_PACKAGE "qbittorrent" "sbwml/luci-app-qbittorrent" "master" "" "qt6base qt6tools rblibtorrent"
-UPDATE_PACKAGE "quickfile" "sbwml/luci-app-quickfile" "main"
+#UPDATE_PACKAGE "diskman" "sbwml/luci-app-diskman" "main"
+#UPDATE_PACKAGE "mosdns" "sbwml/luci-app-mosdns" "v5" "" "v2dat"
+#UPDATE_PACKAGE "openlist2" "sbwml/luci-app-openlist2" "main"
+#UPDATE_PACKAGE "qbittorrent" "sbwml/luci-app-qbittorrent" "master" "" "qt6base qt6tools rblibtorrent"
+#UPDATE_PACKAGE "quickfile" "sbwml/luci-app-quickfile" "main"
 
-UPDATE_PACKAGE "ddns-go" "sirpdboy/luci-app-ddns-go" "main"
-UPDATE_PACKAGE "netspeedtest" "sirpdboy/netspeedtest" "main" "" "homebox ookla-speedtest"
-UPDATE_PACKAGE "netwizard" "sirpdboy/luci-app-netwizard" "main"
-UPDATE_PACKAGE "partexp" "sirpdboy/luci-app-partexp" "main"
+#UPDATE_PACKAGE "ddns-go" "sirpdboy/luci-app-ddns-go" "main"
+#UPDATE_PACKAGE "netspeedtest" "sirpdboy/netspeedtest" "main" "" "homebox ookla-speedtest"
+#UPDATE_PACKAGE "netwizard" "sirpdboy/luci-app-netwizard" "main"
+#UPDATE_PACKAGE "partexp" "sirpdboy/luci-app-partexp" "main"
+
 UPDATE_PACKAGE "timecontrol" "gaobin89/luci-app-timecontrol" "js"
 
 UPDATE_PACKAGE "natmapt" "muink/openwrt-natmapt" "master"
 UPDATE_PACKAGE "stuntman" "muink/openwrt-stuntman" "master"
 UPDATE_PACKAGE "luci-app-natmapt" "muink/luci-app-natmapt" "master"
 
-UPDATE_PACKAGE "airpi3000m" "LianXia233/luci-app-airpi3000m-fancontrol" "main"
-UPDATE_PACKAGE "h5000m" "LianXia233/luci-app-h5000m-netmode" "main"
-UPDATE_PACKAGE "qmodem-generic" "LianXia233/luci-app-qmodem-generic" "main"
+#UPDATE_PACKAGE "airpi3000m" "LianXia233/luci-app-airpi3000m-fancontrol" "main"
+#UPDATE_PACKAGE "h5000m" "LianXia233/luci-app-h5000m-netmode" "main"
+#UPDATE_PACKAGE "qmodem-generic" "LianXia233/luci-app-qmodem-generic" "main"
+
+find . -maxdepth 4 -type d \( -name "*gecoosac*" \) -exec rm -rf {} +
+UPDATE_PACKAGE "luci-app-gecoosac" "laipeng668/luci-app-gecoosac" "main" "" "gecoosac luci-app-gecoosac"
+
+find . -maxdepth 4 -type d \( -name "*timecontrol*" \) -exec rm -rf {} +
+UPDATE_PACKAGE "luci-app-timecontrol" "gaobin89/luci-app-timecontrol" "js" "" "luci-app-timecontrol"
+
+UPDATE_PACKAGE "openwrt-bandix" "timsaya/openwrt-bandix" "main" "" "openwrt-bandix"
+UPDATE_PACKAGE "luci-app-bandix" "timsaya/luci-app-bandix" "main" "" "luci-app-bandix"
+
+#find . -maxdepth 4 -type d \( -name "*luci-app-homeproxy*" \) -exec rm -rf {} +
+#UPDATE_PACKAGE "luci-app-homeproxy"  "XiaoHaiSly/luci-app-homeproxy" "main" "" "luci-app-homeproxy"
 
 #更新软件包版本
 UPDATE_VERSION() {
@@ -140,19 +223,6 @@ UPDATE_VERSION() {
 
 #UPDATE_VERSION "软件包名" "测试版，true，可选，默认为否"
 #UPDATE_VERSION "sing-box"
-
-find . -maxdepth 4 -type d \( -name "*gecoosac*" \) -exec rm -rf {} +
-UPDATE_PACKAGE "luci-app-gecoosac" "laipeng668/luci-app-gecoosac" "main" "" "gecoosac luci-app-gecoosac"
-
-find . -maxdepth 4 -type d \( -name "*timecontrol*" \) -exec rm -rf {} +
-UPDATE_PACKAGE "luci-app-timecontrol" "gaobin89/luci-app-timecontrol" "js" "" "luci-app-timecontrol"
-
-UPDATE_PACKAGE "openwrt-bandix" "timsaya/openwrt-bandix" "main" "" "openwrt-bandix"
-UPDATE_PACKAGE "luci-app-bandix" "timsaya/luci-app-bandix" "main" "" "luci-app-bandix"
-
-find . -maxdepth 4 -type d \( -name "*luci-app-homeproxy*" \) -exec rm -rf {} +
-#UPDATE_PACKAGE "luci-app-homeproxy"  "XiaoHaiSly/luci-app-homeproxy" "main" "" "luci-app-homeproxy"
-
 
 #引入私有扩展脚本
 if [ -f "$GITHUB_WORKSPACE/Scripts/PRIVATE.sh" ]; then
