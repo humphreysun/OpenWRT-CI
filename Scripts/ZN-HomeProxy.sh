@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -91,26 +90,6 @@ repo_origin_matches() {
 
 # ------------------------------------------------------------------
 # Remove every existing luci-app-homeproxy source from the build tree.
-#
-# This is intentional.
-#
-# The previous V3 behavior could accept an already-existing HomeProxy
-# package. That allowed an unrelated/old package such as:
-#
-#   luci-app-homeproxy-26.261.08411~adc898b
-#
-# to survive and be selected before ZN fetched the intended szwjp source.
-#
-# V4 therefore establishes a clean HomeProxy source point:
-#
-#   existing luci-app-homeproxy
-#           ↓
-#        remove
-#           ↓
-#   fetch szwjp
-#
-# Only directories named exactly "luci-app-homeproxy" are removed.
-# sing-box and all other packages are untouched.
 # ------------------------------------------------------------------
 
 remove_existing_homeproxy() {
@@ -153,9 +132,6 @@ remove_existing_homeproxy() {
 
 # ------------------------------------------------------------------
 # Fetch HomeProxy from the primary source, with fallback.
-#
-# This function is used inside command substitution, so diagnostic
-# output goes to stderr and only the final path goes to stdout.
 # ------------------------------------------------------------------
 
 fetch_homeproxy() {
@@ -272,10 +248,6 @@ done
 
 # ------------------------------------------------------------------
 # 2. Upstream sanity checks.
-#
-# No sing-box version is imposed here.
-# The selected upstream HomeProxy generator remains the authority
-# for sing-box syntax and compatibility.
 # ------------------------------------------------------------------
 
 grep -q 'bypass_mainland_china' "$GEN_FILE" || \
@@ -295,19 +267,12 @@ mkdir -p "$HP_SRS"
 
 declare -A SRS_URLS=(
     ["cn.srs"]="https://fastly.jsdelivr.net/gh/1715173329/IPCIDR-CHINA@rule-set/cn.srs"
-
     ["geosite-geolocation-cn.srs"]="https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/geosite-geolocation-cn.srs"
-
     ["geosite-geolocation-!cn.srs"]="https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/geosite-geolocation-!cn.srs"
-
     ["geosite-google.srs"]="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-google.srs"
-
     ["geosite-openai.srs"]="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-openai.srs"
-
     ["geosite-anthropic.srs"]="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-anthropic.srs"
-
     ["geosite-whatsapp.srs"]="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-whatsapp.srs"
-
     ["geosite-zoom.srs"]="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-zoom.srs"
 )
 
@@ -358,7 +323,6 @@ else
 fi
 
 
-# The three built-in rule-sets are mandatory.
 for FILE in \
     "cn.srs" \
     "geosite-geolocation-cn.srs" \
@@ -371,28 +335,6 @@ done
 
 # ------------------------------------------------------------------
 # 4. Localize only the three semantic rule-set objects.
-#
-# Target mapping:
-#
-#   geoip-cn
-#       -> /etc/homeproxy/private_srs/cn.srs
-#
-#   geosite-cn
-#       -> /etc/homeproxy/private_srs/geosite-geolocation-cn.srs
-#
-#   geosite-noncn
-#       -> /etc/homeproxy/private_srs/geosite-geolocation-!cn.srs
-#
-# We deliberately do NOT replace the entire bypass_mainland_china block.
-# Custom Routing and all other upstream generator logic remain untouched.
-#
-# For each target:
-#   remote -> local
-#   remove url
-#   remove download_detour
-#   add path
-#
-# update_interval is deliberately NOT retained for local rule-sets.
 # ------------------------------------------------------------------
 
 python3 - "$GEN_FILE" "$GEN_FILE.tmp" "$HP_SRS_REL" <<'PY'
@@ -487,23 +429,14 @@ for start, end, obj in objects:
 
     found.add(tag)
 
-    # Already local: do not modify an upstream-local implementation.
-    if re.search(
-        r"\btype\s*:\s*['\"]local['\"]",
-        obj
-    ):
+    if re.search(r"\btype\s*:\s*['\"]local['\"]", obj):
         if not re.search(r"\bpath\s*:", obj):
             raise SystemExit(
                 f"{tag}: already local but has no path; refusing to guess"
             )
-
         continue
 
-    # We only understand the expected upstream remote object.
-    if not re.search(
-        r"\btype\s*:\s*['\"]remote['\"]",
-        obj
-    ):
+    if not re.search(r"\btype\s*:\s*['\"]remote['\"]", obj):
         raise SystemExit(
             f"{tag}: unsupported rule-set type; refusing to guess"
         )
@@ -519,9 +452,9 @@ for start, end, obj in objects:
         count=1,
     )
 
-    # Remove remote URL.
+    # 灵活移除 url 字段（容忍任意前导空格、行首/非行首及多余逗号与换行）
     new_obj, n_url = re.subn(
-        r"(?m)^[ \t]*url\s*:\s*['\"][^'\"]+['\"]\s*,[ \t]*\n",
+        r"[ \t]*\burl\s*:\s*['\"][^'\"]+['\"]\s*,?[ \t]*\n?",
         "",
         new_obj,
         count=1,
@@ -532,23 +465,21 @@ for start, end, obj in objects:
             f"{tag}: remote rule-set has no recognizable url field"
         )
 
-    # Remove remote-only download_detour.
+    # 灵活移除 download_detour 字段
     new_obj = re.sub(
-        r"(?m)^[ \t]*download_detour\s*:\s*[^,\n]+,[ \t]*\n",
+        r"[ \t]*\bdownload_detour\s*:\s*[^,\n]+,?[ \t]*\n?",
         "",
         new_obj,
-        count=1,
     )
 
-    # Remove update_interval from local rule-set.
+    # 灵活移除 update_interval 字段
     new_obj = re.sub(
-        r"(?m)^[ \t]*update_interval\s*:\s*[^,\n]+,[ \t]*\n",
+        r"[ \t]*\bupdate_interval\s*:\s*[^,\n]+,?[ \t]*\n?",
         "",
         new_obj,
-        count=1,
     )
 
-    # Add local path after format.
+    # 补全或替换 local path
     if re.search(r"\bpath\s*:", new_obj):
         new_obj = re.sub(
             r"(\bpath\s*:\s*)[^,\n]+,?",
@@ -563,19 +494,14 @@ for start, end, obj in objects:
         )
 
         if format_match:
-            indent = re.match(
-                r"[ \t]*",
-                format_match.group(1)
-            ).group(0)
-
+            indent = re.match(r"[ \t]*", format_match.group(1)).group(0)
             replacement = (
                 format_match.group(1)
                 + "\n"
                 + indent
-                + f"path: {local_path}"
+                + f"path: {local_path},"
                 + "\n"
             )
-
             new_obj = (
                 new_obj[:format_match.start()]
                 + replacement
@@ -592,28 +518,21 @@ for start, end, obj in objects:
                     f"{tag}: cannot determine where to insert local path"
                 )
 
-            indent = re.match(
-                r"[ \t]*",
-                type_match.group(1)
-            ).group(0)
-
+            indent = re.match(r"[ \t]*", type_match.group(1)).group(0)
             replacement = (
                 type_match.group(1)
                 + "\n"
                 + indent
-                + f"path: {local_path}"
+                + f"path: {local_path},"
                 + "\n"
             )
-
             new_obj = (
                 new_obj[:type_match.start()]
                 + replacement
                 + new_obj[type_match.end():]
             )
 
-    replacements.append(
-        (start, end, new_obj)
-    )
+    replacements.append((start, end, new_obj))
 
 
 for tag in targets:
@@ -752,45 +671,20 @@ while True:
     if tag_match and tag_match.group(1) in targets:
         tag = tag_match.group(1)
 
-        if re.search(
-            r"\btype\s*:\s*['\"]remote['\"]",
-            obj
-        ):
-            raise SystemExit(
-                f"{tag} is still remote"
-            )
+        if re.search(r"\btype\s*:\s*['\"]remote['\"]", obj):
+            raise SystemExit(f"{tag} is still remote")
 
-        if not re.search(
-            r"\btype\s*:\s*['\"]local['\"]",
-            obj
-        ):
-            raise SystemExit(
-                f"{tag} has no local type"
-            )
+        if not re.search(r"\btype\s*:\s*['\"]local['\"]", obj):
+            raise SystemExit(f"{tag} has no local type")
 
-        if re.search(
-            r"\burl\s*:",
-            obj
-        ):
-            raise SystemExit(
-                f"{tag} still contains url"
-            )
+        if re.search(r"\burl\s*:", obj):
+            raise SystemExit(f"{tag} still contains url")
 
-        if re.search(
-            r"\bdownload_detour\s*:",
-            obj
-        ):
-            raise SystemExit(
-                f"{tag} still contains download_detour"
-            )
+        if re.search(r"\bdownload_detour\s*:", obj):
+            raise SystemExit(f"{tag} still contains download_detour")
 
-        if re.search(
-            r"\bupdate_interval\s*:",
-            obj
-        ):
-            raise SystemExit(
-                f"{tag} still contains update_interval"
-            )
+        if re.search(r"\bupdate_interval\s*:", obj):
+            raise SystemExit(f"{tag} still contains update_interval")
 
     pos = end + 1
 PY
@@ -806,8 +700,6 @@ else
 fi
 
 
-# Do not hard-code a particular sing-box version.
-# Verify that upstream HomeProxy retains its own runtime detection.
 if grep -q 'sing-box version' "$INIT_FILE"; then
     pass_check "upstream HomeProxy retains runtime sing-box version detection"
 else
@@ -815,7 +707,6 @@ else
 fi
 
 
-# Custom Routing / routing model must remain present.
 if grep -q 'routing_mode' "$GEN_FILE"; then
     pass_check "upstream routing model preserved"
 else
@@ -875,4 +766,3 @@ find "$HP_SRS" \
 
 
 echo "=== ZN HomeProxy v4 processing complete ==="
-
