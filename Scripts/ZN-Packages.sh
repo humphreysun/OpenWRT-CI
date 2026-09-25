@@ -103,47 +103,28 @@ DOWNLOAD_FILE() {
 # 只下载 sing-box package，不引入其他 VIKINGYFY packages
 # ============================================================
 
-echo "[ZN-Packages] Importing VIKINGYFY sing-box..."
+#echo "[ZN-Packages] Importing VIKINGYFY sing-box..."
 rm -rf ./package/sing-box
 
 # 删除 feeds 中官方 sing-box，避免重复
 find ./feeds/packages -maxdepth 3 -type d -name "sing-box" \
     -print -exec rm -rf {} +
 
-SINGBOX_PATH="./package/sing-box"
-SINGBOX_BASE="https://raw.githubusercontent.com/VIKINGYFY/packages/main/sing-box"
-
-mkdir -p \
-    "$SINGBOX_PATH/files" \
-    "$SINGBOX_PATH/patches"
-
-DOWNLOAD_FILE \
-    "$SINGBOX_BASE/Makefile" \
-    "$SINGBOX_PATH/Makefile"
-
-DOWNLOAD_FILE \
-    "$SINGBOX_BASE/files/sing-box.conf" \
-    "$SINGBOX_PATH/files/sing-box.conf"
-
-DOWNLOAD_FILE \
-    "$SINGBOX_BASE/files/sing-box.init" \
-    "$SINGBOX_PATH/files/sing-box.init"
-
-DOWNLOAD_FILE \
-    "$SINGBOX_BASE/patches/100-fix-dns-tcp-close.patch" \
-    "$SINGBOX_PATH/patches/100-fix-dns-tcp-close.patch"
-
-echo "[ZN-Packages] VIKINGYFY sing-box imported."
-
-grep -E '^(PKG_NAME|PKG_UPSTREAM_VERSION|PKG_VERSION|PKG_RELEASE):=' \
-    "$SINGBOX_PATH/Makefile"
-
-echo "[ZN-Packages] sing-box package files:"
-find "$SINGBOX_PATH" -type f
-echo "[ZN-Packages] VIKINGYFY sing-box imported."
+#SINGBOX_PATH="./package/sing-box"
+#SINGBOX_BASE="https://raw.githubusercontent.com/VIKINGYFY/packages/main/sing-box"
+#mkdir -p "$SINGBOX_PATH/files" "$SINGBOX_PATH/patches"
+#DOWNLOAD_FILE "$SINGBOX_BASE/Makefile" "$SINGBOX_PATH/Makefile"
+#DOWNLOAD_FILE "$SINGBOX_BASE/files/sing-box.conf" "$SINGBOX_PATH/files/sing-box.conf"
+#DOWNLOAD_FILE "$SINGBOX_BASE/files/sing-box.init" "$SINGBOX_PATH/files/sing-box.init"
+#DOWNLOAD_FILE  "$SINGBOX_BASE/patches/100-fix-dns-tcp-close.patch"   "$SINGBOX_PATH/patches/100-fix-dns-tcp-close.patch"
+#echo "[ZN-Packages] VIKINGYFY sing-box imported."
+#grep -E '^(PKG_NAME|PKG_UPSTREAM_VERSION|PKG_VERSION|PKG_RELEASE):='"$SINGBOX_PATH/Makefile"
+#echo "[ZN-Packages] sing-box package files:"
+#find "$SINGBOX_PATH" -type f
+#echo "[ZN-Packages] VIKINGYFY sing-box imported."
 
 # 官方 HomeProxy
-UPDATE_PACKAGE "homeproxy" "immortalwrt/homeproxy" "master"
+#UPDATE_PACKAGE "homeproxy" "immortalwrt/homeproxy" "master"
 
 #UPDATE_PACKAGE "vnt" "lmq8267/luci-app-vnt" "main"
 
