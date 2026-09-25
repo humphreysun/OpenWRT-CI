@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ZN-HomeProxy v4
+# ZN-HomeProxy v6
 #
 # Design:
 #   - Always remove any existing luci-app-homeproxy source from the build tree.
@@ -12,7 +12,8 @@ set -euo pipefail
 #     selected upstream HomeProxy generator.
 #   - ZN only:
 #       1. bundles 8 SRS files;
-#       2. localizes the three built-in mainland-China rule-sets;
+#       2. replaces the three built-in mainland-China rule-set objects
+#          with fixed local rule-set objects;
 #       3. persists /etc/homeproxy/private_srs/ across sysupgrade.
 #   - Custom Routing and all other upstream HomeProxy logic are preserved.
 #
@@ -20,8 +21,10 @@ set -euo pipefail
 #   ZN_HOMEProxy_PRIMARY_REPO
 #   ZN_HOMEProxy_FALLBACK_REPO
 #   ZN_HOMEProxy_BRANCH
-#   ZN_HOMEProxy_AUTO_FETCH=0|1   (default: 1)
-#   ZN_SKIP_SRS=1
+#       Empty by default: use repository default branch.
+#       Set explicitly only when a specific branch is required.
+#   ZN_HOMEProxy_AUTO_FETCH=0|1
+#       Default: 1.
 #
 # Usage:
 #   ./ZN-HomeProxy.sh
@@ -36,13 +39,29 @@ HP_SRS_REL="/etc/homeproxy/private_srs"
 
 PRIMARY_REPO="${ZN_HOMEProxy_PRIMARY_REPO:-https://github.com/szwjp/luci-app-homeproxy.git}"
 FALLBACK_REPO="${ZN_HOMEProxy_FALLBACK_REPO:-https://github.com/htcnokia/luci-app-homeproxy.git}"
-HP_BRANCH="${ZN_HOMEProxy_BRANCH:-main}"
+HP_BRANCH="${ZN_HOMEProxy_BRANCH:-}"
 AUTO_FETCH="${ZN_HOMEProxy_AUTO_FETCH:-1}"
 
-log()  { printf '[ZN-HomeProxy] %s\n' "$*"; }
-warn() { printf '[ZN-HomeProxy][WARN] %s\n' "$*" >&2; }
-die()  { printf '[ZN-HomeProxy][ERROR] %s\n' "$*" >&2; exit 1; }
+log() {
+    printf '[ZN-HomeProxy] %s\n' "$*"
+}
 
+warn() {
+    printf '[ZN-HomeProxy][WARN] %s\n' "$*" >&2
+}
+
+die() {
+    printf '[ZN-HomeProxy][ERROR] %s\n' "$*" >&2
+    exit 1
+}
+
+pass_check() {
+    printf '[PASS] %s\n' "$*"
+}
+
+fail_check() {
+    printf '[FAIL] %s\n' "$*"
+}
 
 # ------------------------------------------------------------------
 # Basic HomeProxy package validation.
@@ -79,6 +98,7 @@ repo_origin_matches() {
                 local a b
                 a="${remote%.git}"
                 b="${origin%.git}"
+
                 [ "${a,,}" = "${b,,}" ] && return 0
                 ;;
         esac
@@ -114,9 +134,11 @@ remove_existing_homeproxy() {
         log "Removing existing HomeProxy source: $p"
         rm -rf -- "$p"
         found=1
+
     done < <(
         find "$ROOT" \
             -depth \
+            -type d \
             -name 'luci-app-homeproxy' \
             -print0 \
             2>/dev/null
@@ -132,6 +154,12 @@ remove_existing_homeproxy() {
 
 # ------------------------------------------------------------------
 # Fetch HomeProxy from the primary source, with fallback.
+#
+# Default behavior:
+#   use repository default branch.
+#
+# Optional:
+#   ZN_HOMEProxy_BRANCH=some-branch
 # ------------------------------------------------------------------
 
 fetch_homeproxy() {
@@ -147,16 +175,30 @@ fetch_homeproxy() {
 
     local target="$ROOT/package/luci-app-homeproxy"
     local tmp="$ROOT/.zn-homeproxy-bootstrap"
+    local -a clone_args
 
     rm -rf -- "$tmp"
     rm -rf -- "$target"
+
+    clone_args=(
+        --depth 1
+    )
+
+    if [ -n "$HP_BRANCH" ]; then
+        clone_args+=(
+            --branch "$HP_BRANCH"
+        )
+
+        log "HomeProxy branch override: $HP_BRANCH"
+    else
+        log "HomeProxy branch: repository default"
+    fi
 
     printf '[ZN-HomeProxy] Trying primary upstream: %s\n' \
         "$PRIMARY_REPO" >&2
 
     if git clone \
-        --depth 1 \
-        --branch "$HP_BRANCH" \
+        "${clone_args[@]}" \
         "$PRIMARY_REPO" \
         "$tmp" \
         >/dev/null 2>&1
@@ -167,6 +209,7 @@ fetch_homeproxy() {
 
             printf '[ZN-HomeProxy] Using primary HomeProxy source: %s\n' \
                 "$PRIMARY_REPO" >&2
+
             printf '%s\n' "$target"
             return 0
         fi
@@ -182,8 +225,7 @@ fetch_homeproxy() {
         "$FALLBACK_REPO" >&2
 
     if git clone \
-        --depth 1 \
-        --branch "$HP_BRANCH" \
+        "${clone_args[@]}" \
         "$FALLBACK_REPO" \
         "$tmp" \
         >/dev/null 2>&1
@@ -194,6 +236,7 @@ fetch_homeproxy() {
 
             printf '[ZN-HomeProxy] Using fallback HomeProxy source: %s\n' \
                 "$FALLBACK_REPO" >&2
+
             printf '%s\n' "$target"
             return 0
         fi
@@ -281,14 +324,18 @@ download_file() {
     local url="$1"
     local out="$2"
 
+    rm -f -- "$out.tmp"
+
     if command -v curl >/dev/null 2>&1; then
         curl \
             -fL \
             --retry 3 \
             --retry-delay 2 \
             --connect-timeout 15 \
+            --max-time 120 \
             -o "$out.tmp" \
             "$url"
+
     elif command -v wget >/dev/null 2>&1; then
         wget \
             -q \
@@ -296,45 +343,63 @@ download_file() {
             --tries=3 \
             -O "$out.tmp" \
             "$url"
+
     else
         echo "[ERROR] Neither curl nor wget is available on the build host." >&2
         return 1
     fi
 
-    [ -s "$out.tmp" ] || return 1
+    [ -s "$out.tmp" ] || {
+        warn "Downloaded file is empty: $url"
+        return 1
+    }
+
+    # Reject obvious HTML/text error pages.
+    #
+    # SRS is binary data. This check is intentionally conservative:
+    # it only rejects unmistakable web/error-page signatures.
+    if LC_ALL=C head -c 256 "$out.tmp" |
+        grep -Eiq \
+            '<!doctype html|<html|<head|<body|404:[[:space:]]*not[[:space:]]*found|access denied'
+    then
+        warn "Downloaded response looks like an HTML/text error page: $url"
+        return 1
+    fi
 
     mv -f "$out.tmp" "$out"
 }
 
 
-if [ "${ZN_SKIP_SRS:-0}" = "1" ]; then
-    log "ZN_SKIP_SRS=1: SRS download skipped."
-else
-    for FILE in "${!SRS_URLS[@]}"; do
-        log "SRS: $FILE"
-
-        download_file \
-            "${SRS_URLS[$FILE]}" \
-            "$HP_SRS/$FILE" || {
-                rm -f "$HP_SRS/$FILE.tmp"
-                die "Failed to download SRS: $FILE"
-            }
-    done
-fi
-
-
 for FILE in \
     "cn.srs" \
     "geosite-geolocation-cn.srs" \
-    "geosite-geolocation-!cn.srs"
+    "geosite-geolocation-!cn.srs" \
+    "geosite-google.srs" \
+    "geosite-openai.srs" \
+    "geosite-anthropic.srs" \
+    "geosite-whatsapp.srs" \
+    "geosite-zoom.srs"
 do
-    [ -s "$HP_SRS/$FILE" ] || \
-        die "Required private SRS missing or empty: $FILE"
+    log "SRS: $FILE"
+
+    download_file \
+        "${SRS_URLS[$FILE]}" \
+        "$HP_SRS/$FILE" || {
+            rm -f -- "$HP_SRS/$FILE.tmp"
+            die "Failed to download SRS: $FILE"
+        }
 done
 
 
 # ------------------------------------------------------------------
-# 4. Localize only the three semantic rule-set objects.
+# 4. Replace only the three semantic rule-set objects.
+#
+# IMPORTANT:
+#   The entire matching object is replaced.
+#
+# This deliberately does NOT modify an existing object in-place.
+# Therefore no future upstream remote-only attributes can accidentally
+# leak into the local rule-set definition.
 # ------------------------------------------------------------------
 
 python3 - "$GEN_FILE" "$GEN_FILE.tmp" "$HP_SRS_REL" <<'PY'
@@ -344,198 +409,12 @@ from pathlib import Path
 
 src = Path(sys.argv[1])
 dst = Path(sys.argv[2])
+s = src.read_text()
 
 targets = {
     "geoip-cn": "cn.srs",
     "geosite-cn": "geosite-geolocation-cn.srs",
     "geosite-noncn": "geosite-geolocation-!cn.srs",
-}
-
-def matching_brace(text, opening):
-    depth = 0
-    quote = None
-    escape = False
-
-    for i in range(opening, len(text)):
-        c = text[i]
-        if quote:
-            if escape:
-                escape = False
-            elif c == '\\':
-                escape = True
-            elif c == quote:
-                quote = None
-            continue
-
-        if c in ("'", '"'):
-            quote = c
-        elif c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return i
-    return -1
-
-def find_rule_objects(text):
-    needle = "push(config.route.rule_set, {"
-    pos = 0
-    while True:
-        start = text.find(needle, pos)
-        if start < 0:
-            return
-        brace = text.find("{", start)
-        end = matching_brace(text, brace)
-        if end < 0:
-            raise SystemExit("Unbalanced rule-set object in generate_client.uc")
-        yield start, end + 1, text[start:end + 1]
-        pos = end + 1
-
-s = src.read_text()
-objects = list(find_rule_objects(s))
-found = set()
-replacements = []
-
-for start, end, obj in objects:
-    tag_match = re.search(r"\btag\s*:\s*['\"]([^'\"]+)['\"]", obj)
-    if not tag_match:
-        continue
-
-    tag = tag_match.group(1)
-    if tag not in targets:
-        continue
-
-    found.add(tag)
-
-    if re.search(r"\btype\s*:\s*['\"]local['\"]", obj):
-        if not re.search(r"\bpath\s*:", obj):
-            raise SystemExit(f"{tag}: already local but has no path; refusing to guess")
-        continue
-
-    # 自动探测代码缩进风格
-    indent_match = re.search(r"\n([ \t]+)\b(?:tag|type)\b", obj)
-    indent = indent_match.group(1) if indent_match else "\t\t"
-
-    filename = targets[tag]
-    local_path = f"HP_DIR + '/private_srs/{filename}'"
-
-    new_obj = obj
-
-    # 1. 强转 type 为 local
-    new_obj = re.sub(r"(\btype\s*:\s*)['\"]remote['\"]", r"\1'local'", new_obj, count=1)
-
-    # 2. 彻底清洗远端专用属性（兼顾有无引号的情况）
-    new_obj = re.sub(r"[ \t]*\burl\s*:\s*[^,\n\}]+,?[ \t]*\n?", "", new_obj)
-    new_obj = re.sub(r"[ \t]*\bdownload_detour\s*:\s*[^,\n\}]+,?[ \t]*\n?", "", new_obj)
-    new_obj = re.sub(r"[ \t]*\bupdate_interval\s*:\s*[^,\n\}]+,?[ \t]*\n?", "", new_obj)
-
-    # 3. 规范插入或替换 path
-    if re.search(r"\bpath\s*:", new_obj):
-        new_obj = re.sub(r"(\bpath\s*:\s*)[^,\n\}]+", rf"\1{local_path}", new_obj, count=1)
-    else:
-        # 寻找插入锚点：优先 format，其次 type
-        anchor_match = re.search(r"(\bformat\s*:\s*[^,\n\}]+,?)", new_obj)
-        if not anchor_match:
-            anchor_match = re.search(r"(\btype\s*:\s*['\"]local['\"],?)", new_obj)
-
-        if anchor_match:
-            anchor_str = anchor_match.group(1)
-            fixed_anchor = anchor_str if anchor_str.endswith(",") else anchor_str + ","
-            replacement = f"{fixed_anchor}\n{indent}path: {local_path}"
-            new_obj = new_obj.replace(anchor_str, replacement, 1)
-        else:
-            raise SystemExit(f"{tag}: cannot determine insertion position for path")
-
-    # 4. 优化 ucode / JS 对象属性的分隔符与多余空行
-    # 确保属性行之间末尾有逗号
-    lines = [l for l in new_obj.splitlines() if l.strip()]
-    formatted_lines = []
-    for idx, line in enumerate(lines):
-        # 如果不是大括号开头/结尾行，且不是最后一行属性，确保结尾有逗号
-        if idx > 0 and idx < len(lines) - 1:
-            if not line.rstrip().endswith(",") and not line.rstrip().endswith("{"):
-                line = line.rstrip() + ","
-        formatted_lines.append(line)
-    
-    new_obj = "\n".join(formatted_lines)
-    # 去除右大括号前的末尾多余逗号
-    new_obj = re.sub(r",(\s*\})", r"\1", new_obj)
-
-    replacements.append((start, end, new_obj))
-
-for tag in targets:
-    if tag not in found:
-        raise SystemExit(f"Required built-in rule-set tag not found: {tag}")
-
-for start, end, new_obj in reversed(replacements):
-    s = s[:start] + new_obj + s[end:]
-
-dst.write_text(s)
-PY
-
-mv -f "$GEN_FILE.tmp" "$GEN_FILE"
-
-
-# ------------------------------------------------------------------
-# 5. Validation.
-# ------------------------------------------------------------------
-
-fail=0
-
-pass_check() {
-    printf '[PASS] %s\n' "$1"
-}
-
-fail_check() {
-    printf '[FAIL] %s\n' "$1"
-    fail=1
-}
-
-
-for spec in \
-    "geoip-cn|cn.srs" \
-    "geosite-cn|geosite-geolocation-cn.srs" \
-    "geosite-noncn|geosite-geolocation-!cn.srs"
-do
-    tag="${spec%%|*}"
-    file="${spec#*|}"
-
-    if grep \
-        -A12 \
-        -B2 \
-        "tag: '$tag'" \
-        "$GEN_FILE" |
-        grep -q "type: 'local'"
-    then
-        if grep \
-            -A12 \
-            -B2 \
-            "tag: '$tag'" \
-            "$GEN_FILE" |
-            grep -q "path: HP_DIR + '/private_srs/$file'"
-        then
-            pass_check "$tag -> local $file"
-        else
-            fail_check "$tag -> missing local path $file"
-        fi
-    else
-        fail_check "$tag -> not local"
-    fi
-done
-
-
-# Strictly verify that the three target objects are no longer remote.
-python3 - "$GEN_FILE" <<'PY'
-import re
-import sys
-from pathlib import Path
-
-s = Path(sys.argv[1]).read_text()
-
-targets = {
-    "geoip-cn",
-    "geosite-cn",
-    "geosite-noncn",
 }
 
 needle = "push(config.route.rule_set, {"
@@ -552,7 +431,7 @@ def matching_brace(text, opening):
         if quote:
             if escape:
                 escape = False
-            elif c == '\\':
+            elif c == "\\":
                 escape = True
             elif c == quote:
                 quote = None
@@ -560,9 +439,9 @@ def matching_brace(text, opening):
 
         if c in ("'", '"'):
             quote = c
-        elif c == '{':
+        elif c == "{":
             depth += 1
-        elif c == '}':
+        elif c == "}":
             depth -= 1
 
             if depth == 0:
@@ -571,6 +450,169 @@ def matching_brace(text, opening):
     return -1
 
 
+def find_rule_objects(text):
+    pos = 0
+
+    while True:
+        start = text.find(needle, pos)
+
+        if start < 0:
+            return
+
+        brace = text.find("{", start)
+
+        if brace < 0:
+            raise SystemExit(
+                "Unable to locate opening brace for rule-set object"
+            )
+
+        end = matching_brace(text, brace)
+
+        if end < 0:
+            raise SystemExit(
+                "Unbalanced rule-set object in generate_client.uc"
+            )
+
+        # Include the object's closing brace, but not the trailing ';'.
+        yield start, end + 1, text[start:end + 1]
+
+        pos = end + 1
+
+
+def detect_indent(obj):
+    match = re.search(
+        r"\n([ \t]+)(?:type|tag|format|path)\s*:",
+        obj
+    )
+
+    if match:
+        return match.group(1)
+
+    return "\t\t"
+
+
+objects = list(find_rule_objects(s))
+found = set()
+replacements = []
+
+for start, end, obj in objects:
+    tag_match = re.search(
+        r"\btag\s*:\s*['\"]([^'\"]+)['\"]",
+        obj
+    )
+
+    if not tag_match:
+        continue
+
+    tag = tag_match.group(1)
+
+    if tag not in targets:
+        continue
+
+    found.add(tag)
+
+    filename = targets[tag]
+
+    indent = detect_indent(obj)
+
+    local_obj = (
+        "push(config.route.rule_set, {\n"
+        f"{indent}type: 'local',\n"
+        f"{indent}tag: '{tag}',\n"
+        f"{indent}format: 'binary',\n"
+        f"{indent}path: HP_DIR + '/private_srs/{filename}'\n"
+        "});"
+    )
+
+    # Replace the entire object including push(...), not just selected
+    # properties. This guarantees that remote-only upstream attributes
+    # cannot survive the transformation.
+    replacements.append(
+        (start, end, local_obj[:-2])  # exclude "});" because source end is "}"
+    )
+
+# The replacement range currently ends at the object's closing "}".
+# Reconstruct the exact object while preserving the original trailing ';'.
+#
+# Since the original source is:
+#   push(config.route.rule_set, {...});
+#
+# replace the complete range from push(...) through "}" and retain ";".
+
+for start, end, new_obj_without_semicolon in reversed(replacements):
+    s = (
+        s[:start]
+        + new_obj_without_semicolon
+        + "}"
+        + s[end:]
+    )
+
+for tag in targets:
+    if tag not in found:
+        raise SystemExit(
+            f"Required built-in rule-set tag not found: {tag}"
+        )
+
+dst.write_text(s)
+PY
+
+mv -f "$GEN_FILE.tmp" "$GEN_FILE"
+
+
+# ------------------------------------------------------------------
+# 5. Strict structural validation.
+#
+# Validation is performed against the actual brace-delimited object,
+# never with grep context ranges.
+# ------------------------------------------------------------------
+
+python3 - "$GEN_FILE" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+s = Path(sys.argv[1]).read_text()
+
+targets = {
+    "geoip-cn": "cn.srs",
+    "geosite-cn": "geosite-geolocation-cn.srs",
+    "geosite-noncn": "geosite-geolocation-!cn.srs",
+}
+
+needle = "push(config.route.rule_set, {"
+
+
+def matching_brace(text, opening):
+    depth = 0
+    quote = None
+    escape = False
+
+    for i in range(opening, len(text)):
+        c = text[i]
+
+        if quote:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == quote:
+                quote = None
+            continue
+
+        if c in ("'", '"'):
+            quote = c
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+
+            if depth == 0:
+                return i
+
+    return -1
+
+
+found = set()
 pos = 0
 
 while True:
@@ -580,6 +622,12 @@ while True:
         break
 
     brace = s.find("{", start)
+
+    if brace < 0:
+        raise SystemExit(
+            "Unable to locate opening brace for rule-set object"
+        )
+
     end = matching_brace(s, brace)
 
     if end < 0:
@@ -592,59 +640,165 @@ while True:
         obj
     )
 
-    if tag_match and tag_match.group(1) in targets:
+    if tag_match:
         tag = tag_match.group(1)
 
-        if re.search(r"\btype\s*:\s*['\"]remote['\"]", obj):
-            raise SystemExit(f"{tag} is still remote")
+        if tag in targets:
+            found.add(tag)
 
-        if not re.search(r"\btype\s*:\s*['\"]local['\"]", obj):
-            raise SystemExit(f"{tag} has no local type")
+            expected_file = targets[tag]
 
-        if re.search(r"\burl\s*:", obj):
-            raise SystemExit(f"{tag} still contains url")
+            if re.search(
+                r"\btype\s*:\s*['\"]remote['\"]",
+                obj
+            ):
+                raise SystemExit(
+                    f"{tag} is still remote"
+                )
 
-        if re.search(r"\bdownload_detour\s*:", obj):
-            raise SystemExit(f"{tag} still contains download_detour")
+            if not re.search(
+                r"\btype\s*:\s*['\"]local['\"]",
+                obj
+            ):
+                raise SystemExit(
+                    f"{tag} has no local type"
+                )
 
-        if re.search(r"\bupdate_interval\s*:", obj):
-            raise SystemExit(f"{tag} still contains update_interval")
+            expected_path = (
+                r"HP_DIR\s*\+\s*['\"]"
+                r"/private_srs/"
+                + re.escape(expected_file)
+                + r"['\"]"
+            )
+
+            if not re.search(
+                rf"\bpath\s*:\s*{expected_path}",
+                obj
+            ):
+                raise SystemExit(
+                    f"{tag} has incorrect or missing local path"
+                )
+
+            if re.search(r"\burl\s*:", obj):
+                raise SystemExit(
+                    f"{tag} still contains url"
+                )
+
+            if re.search(r"\bdownload_detour\s*:", obj):
+                raise SystemExit(
+                    f"{tag} still contains download_detour"
+                )
+
+            if re.search(r"\bupdate_interval\s*:", obj):
+                raise SystemExit(
+                    f"{tag} still contains update_interval"
+                )
+
+            properties = re.findall(
+                r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:",
+                obj,
+                flags=re.MULTILINE,
+            )
+
+            allowed = {
+                "type",
+                "tag",
+                "format",
+                "path",
+            }
+
+            unexpected = [
+                prop for prop in properties
+                if prop not in allowed
+            ]
+
+            if unexpected:
+                raise SystemExit(
+                    f"{tag} contains unexpected properties: "
+                    + ", ".join(unexpected)
+                )
+
+            print(
+                f"[PASS] {tag} -> local "
+                f"/etc/homeproxy/private_srs/{expected_file}"
+            )
 
     pos = end + 1
+
+
+missing = set(targets) - found
+
+if missing:
+    raise SystemExit(
+        "Missing required rule-set tags: "
+        + ", ".join(sorted(missing))
+    )
 PY
 
-pass_check "three built-in mainland rule-sets are local-only"
+
+# ------------------------------------------------------------------
+# 6. Validate all eight SRS files.
+# ------------------------------------------------------------------
+
+for FILE in \
+    "cn.srs" \
+    "geosite-geolocation-cn.srs" \
+    "geosite-geolocation-!cn.srs" \
+    "geosite-google.srs" \
+    "geosite-openai.srs" \
+    "geosite-anthropic.srs" \
+    "geosite-whatsapp.srs" \
+    "geosite-zoom.srs"
+do
+    [ -s "$HP_SRS/$FILE" ] || \
+        die "Required private SRS missing or empty: $FILE"
+done
+
+pass_check "all 8 bundled SRS files are present and non-empty"
 
 
-# Native HomeProxy resource updater must remain untouched.
+# ------------------------------------------------------------------
+# 7. Native HomeProxy workflow checks.
+# ------------------------------------------------------------------
+
 if grep -q 'update_resources\.sh' "$UPDATE_CROND"; then
     pass_check "native update_crond -> update_resources.sh"
 else
-    fail_check "native update_crond -> update_resources.sh"
+    die "native update_crond -> update_resources.sh is missing"
+fi
+
+
+if grep -q 'bypass_mainland_china' "$GEN_FILE"; then
+    pass_check "upstream bypass_mainland_china routing model preserved"
+else
+    die "upstream bypass_mainland_china routing model missing"
+fi
+
+
+if grep -q 'routing_mode' "$GEN_FILE"; then
+    pass_check "upstream routing_mode handling preserved"
+else
+    die "upstream routing_mode handling missing"
+fi
+
+
+if grep -q 'sing-box' "$GEN_FILE"; then
+    pass_check "upstream sing-box handling preserved"
+else
+    die "upstream sing-box handling missing"
 fi
 
 
 if grep -q 'sing-box version' "$INIT_FILE"; then
     pass_check "upstream HomeProxy retains runtime sing-box version detection"
 else
-    fail_check "upstream HomeProxy runtime version detection"
-fi
-
-
-if grep -q 'routing_mode' "$GEN_FILE"; then
-    pass_check "upstream routing model preserved"
-else
-    fail_check "upstream routing model missing"
-fi
-
-
-if [ "$fail" -ne 0 ]; then
-    die "ZN HomeProxy validation failed."
+    warn "Could not find literal 'sing-box version' in init script."
+    warn "This is informational only; no sing-box version logic is being added."
 fi
 
 
 # ------------------------------------------------------------------
-# 6. Persist private SRS across sysupgrade.
+# 8. Persist private SRS across sysupgrade.
 # ------------------------------------------------------------------
 
 SYSUPGRADE_CONF="$ROOT/package/base-files/files/etc/sysupgrade.conf"
@@ -658,25 +812,39 @@ if [ -d "$ROOT/package/base-files" ]; then
     else
         log "$HP_SRS_REL/ already exists in sysupgrade.conf"
     fi
+
+    pass_check "sysupgrade persistence configured"
 else
     warn "base-files package not found; sysupgrade.conf was not modified."
 fi
 
 
 # ------------------------------------------------------------------
-# 7. Final report.
+# 9. Final report.
 # ------------------------------------------------------------------
+
+log "=============================================="
+log "ZN-HomeProxy v6 processing complete"
+log "=============================================="
 
 log "HomeProxy source:"
 
 if repo_origin_matches "$HP_PATH" "$PRIMARY_REPO"; then
-    log "  primary: $PRIMARY_REPO"
+    log "  primary : $PRIMARY_REPO"
 elif repo_origin_matches "$HP_PATH" "$FALLBACK_REPO"; then
     log "  fallback: $FALLBACK_REPO"
 else
     log "  local/unidentified source: $HP_PATH"
 fi
 
+log "Generator:"
+log "  $GEN_FILE"
+
+log "Private SRS:"
+log "  $HP_SRS"
+
+log "Sysupgrade:"
+log "  $SYSUPGRADE_CONF"
 
 log "Installed SRS:"
 
@@ -688,5 +856,4 @@ find "$HP_SRS" \
     2>/dev/null |
     sort || true
 
-
-echo "=== ZN HomeProxy v4 processing complete ==="
+log "=============================================="
