@@ -1,415 +1,307 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-# ZN-HomeProxy v6
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 VIKINGYFY
+#
+# ZN-HomeProxy V7
 #
 # Design:
-#   - Always remove any existing luci-app-homeproxy source from the build tree.
-#   - szwjp/luci-app-homeproxy is the primary HomeProxy upstream.
-#   - htcnokia/luci-app-homeproxy is the fallback mirror/fork.
-#   - ZN does NOT provide, replace, or version-lock sing-box.
-#   - sing-box syntax compatibility remains the responsibility of the
-#     selected upstream HomeProxy generator.
-#   - ZN only:
-#       1. bundles 8 SRS files;
-#       2. replaces the three built-in mainland-China rule-set objects
-#          with fixed local rule-set objects;
-#       3. persists /etc/homeproxy/private_srs/ across sysupgrade.
-#   - Custom Routing and all other upstream HomeProxy logic are preserved.
-#
-# Optional environment variables:
-#   ZN_HOMEProxy_PRIMARY_REPO
-#   ZN_HOMEProxy_FALLBACK_REPO
-#   ZN_HOMEProxy_BRANCH
-#       Empty by default: use repository default branch.
-#       Set explicitly only when a specific branch is required.
-#   ZN_HOMEProxy_AUTO_FETCH=0|1
-#       Default: 1.
+#   1. Always remove existing luci-app-homeproxy source from the build tree.
+#   2. Always fetch the upstream HomeProxy source.
+#   3. Prefer szwjp/luci-app-homeproxy, fallback to htcnokia/luci-app-homeproxy.
+#   4. Do not hard-code sing-box version compatibility.
+#   5. Download required SRS files at build time.
+#   6. Only localize the three built-in rule-sets:
+#        geoip-cn
+#        geosite-cn
+#        geosite-noncn
+#   7. Replace the complete RuleSet object, rather than patching individual
+#      properties, so upstream remote/local implementation changes do not
+#      leak into the final configuration.
+#   8. Keep all other upstream HomeProxy logic untouched.
+#   9. Persist /etc/homeproxy/private_srs through sysupgrade.
 #
 # Usage:
-#   ./ZN-HomeProxy.sh
-#   ./ZN-HomeProxy.sh /path/to/openwrt
+#   Scripts/ZN-HomeProxy.sh
 #
-# The script is intended to run after package/feed preparation.
+# Optional:
+#   ZN_HOMEProxy_BRANCH=some-branch Scripts/ZN-HomeProxy.sh
+#
+# If ZN_HOMEProxy_BRANCH is not set, git clone uses the repository's
+# default branch automatically.
+
+set -euo pipefail
 
 ROOT="${1:-${GITHUB_WORKSPACE:-.}}"
 ROOT="$(cd "$ROOT" && pwd)"
 
-HP_SRS_REL="/etc/homeproxy/private_srs"
+PRIMARY_REPO="https://github.com/szwjp/luci-app-homeproxy.git"
+FALLBACK_REPO="https://github.com/htcnokia/luci-app-homeproxy.git"
 
-PRIMARY_REPO="${ZN_HOMEProxy_PRIMARY_REPO:-https://github.com/szwjp/luci-app-homeproxy.git}"
-FALLBACK_REPO="${ZN_HOMEProxy_FALLBACK_REPO:-https://github.com/htcnokia/luci-app-homeproxy.git}"
+# Empty means: use repository default branch.
 HP_BRANCH="${ZN_HOMEProxy_BRANCH:-}"
-AUTO_FETCH="${ZN_HOMEProxy_AUTO_FETCH:-1}"
+
+PACKAGE_DIR="$ROOT/package"
+TARGET_DIR="$PACKAGE_DIR/luci-app-homeproxy"
+
+TMP_ROOT="$ROOT/.zn-homeproxy-tmp"
+TMP_HP="$TMP_ROOT/luci-app-homeproxy"
+
+SRS_DIR="$TARGET_DIR/root/etc/homeproxy/private_srs"
+
+SYSUPGRADE_FILE="$ROOT/package/base-files/files/etc/sysupgrade.conf"
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
 log() {
-    printf '[ZN-HomeProxy] %s\n' "$*" >&2
+	printf '[ZN-HomeProxy] %s\n' "$*" >&2
 }
 
 warn() {
-    printf '[ZN-HomeProxy][WARN] %s\n' "$*" >&2
+	printf '[ZN-HomeProxy][WARN] %s\n' "$*" >&2
 }
 
 die() {
-    printf '[ZN-HomeProxy][ERROR] %s\n' "$*" >&2
-    exit 1
+	printf '[ZN-HomeProxy][ERROR] %s\n' "$*" >&2
+	exit 1
 }
 
-pass_check() {
-    printf '[PASS] %s\n' "$*"
+pass() {
+	printf '[ZN-HomeProxy][PASS] %s\n' "$*" >&2
 }
 
-fail_check() {
-    printf '[FAIL] %s\n' "$*"
-}
+# ---------------------------------------------------------------------------
+# Basic helpers
+# ---------------------------------------------------------------------------
 
-# ------------------------------------------------------------------
-# Basic HomeProxy package validation.
-# ------------------------------------------------------------------
+require_command() {
+	local cmd="$1"
+
+	command -v "$cmd" >/dev/null 2>&1 || \
+		die "Required command not found: $cmd"
+}
 
 is_homeproxy_lineage() {
-    local p="$1"
+	local dir="$1"
+	local makefile="$dir/Makefile"
 
-    [ -f "$p/root/etc/homeproxy/scripts/generate_client.uc" ] &&
-    [ -f "$p/root/etc/homeproxy/scripts/update_resources.sh" ] &&
-    [ -f "$p/root/etc/homeproxy/scripts/update_crond.sh" ] &&
-    [ -f "$p/root/etc/init.d/homeproxy" ] &&
-    [ -f "$p/Makefile" ]
+	[ -f "$makefile" ] || return 1
+
+	grep -Eq \
+		'(^|[[:space:]])PKG_NAME:?=[[:space:]]*luci-app-homeproxy([[:space:]]|$)|(^|[[:space:]])LUCI_PKGARCH:?=[[:space:]]*all' \
+		"$makefile" || return 1
+
+	return 0
 }
-
-
-# ------------------------------------------------------------------
-# Compare git origin with an expected repository.
-# ------------------------------------------------------------------
 
 repo_origin_matches() {
-    local p="$1"
-    local origin="$2"
-    local remote=""
+	local dir="$1"
+	local expected="$2"
+	local origin=""
 
-    if [ -d "$p/.git" ] && command -v git >/dev/null 2>&1; then
-        remote="$(git -C "$p" remote get-url origin 2>/dev/null || true)"
+	[ -d "$dir/.git" ] || return 1
 
-        case "$remote" in
-            "$origin"|"$origin/"*)
-                return 0
-                ;;
-            "https://github.com/"*)
-                local a b
-                a="${remote%.git}"
-                b="${origin%.git}"
+	origin="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
 
-                [ "${a,,}" = "${b,,}" ] && return 0
-                ;;
-        esac
-    fi
-
-    return 1
+	[ "$origin" = "$expected" ] ||
+		[ "$origin" = "${expected%.git}" ] ||
+		[ "$origin" = "${expected%.git}/" ]
 }
 
-
-# ------------------------------------------------------------------
-# Remove every existing luci-app-homeproxy source from the build tree.
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Remove every existing luci-app-homeproxy source
+# ---------------------------------------------------------------------------
 
 remove_existing_homeproxy() {
-    local found=0
-    local p
+	local found=0
+	local path=""
 
-    log "Scanning for existing luci-app-homeproxy sources..."
+	log "Scanning for existing luci-app-homeproxy sources..."
 
-    while IFS= read -r -d '' p; do
-        [ -n "$p" ] || continue
+	while IFS= read -r -d '' path; do
+		found=1
+		log "Removing existing source: $path"
+		rm -rf -- "$path"
+	done < <(
+		find "$ROOT" \
+			-path "$ROOT/.git" -prune -o \
+			-path "$ROOT/.zn-homeproxy-tmp" -prune -o \
+			-type d \
+			-name 'luci-app-homeproxy' \
+			-print0
+	)
 
-        # Never remove anything outside the build root.
-        case "$p" in
-            "$ROOT"/*)
-                ;;
-            *)
-                warn "Ignoring HomeProxy path outside build root: $p"
-                continue
-                ;;
-        esac
+	if [ "$found" -eq 0 ]; then
+		log "No existing luci-app-homeproxy source found."
+	fi
 
-        log "Removing existing HomeProxy source: $p"
-        rm -rf -- "$p"
-        found=1
-
-    done < <(
-        find "$ROOT" \
-            -depth \
-            -type d \
-            -name 'luci-app-homeproxy' \
-            -print0 \
-            2>/dev/null
-    )
-
-    if [ "$found" -eq 0 ]; then
-        log "No existing luci-app-homeproxy source found."
-    else
-        log "Existing luci-app-homeproxy source cleanup complete."
-    fi
+	mkdir -p "$PACKAGE_DIR"
+	rm -rf -- "$TARGET_DIR"
 }
 
-
-# ------------------------------------------------------------------
-# Fetch HomeProxy from the primary source, with fallback.
-#
-# Default behavior:
-#   use repository default branch.
-#
-# Optional:
-#   ZN_HOMEProxy_BRANCH=some-branch
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Fetch HomeProxy
+# ---------------------------------------------------------------------------
 
 fetch_homeproxy() {
-    [ "$AUTO_FETCH" = "1" ] || {
-        warn "ZN_HOMEProxy_AUTO_FETCH=0; automatic HomeProxy fetch disabled."
-        return 1
-    }
+	local repo=""
+	local target=""
+	local clone_args=()
 
-    command -v git >/dev/null 2>&1 || {
-        warn "git is unavailable; cannot fetch HomeProxy source."
-        return 1
-    }
+	mkdir -p "$TMP_ROOT"
+	rm -rf -- "$TMP_HP"
 
-    local target="$ROOT/package/luci-app-homeproxy"
-    local tmp="$ROOT/.zn-homeproxy-bootstrap"
-    local -a clone_args
+	for repo in "$PRIMARY_REPO" "$FALLBACK_REPO"; do
+		rm -rf -- "$TMP_HP"
 
-    rm -rf -- "$tmp"
-    rm -rf -- "$target"
+		log "Trying upstream: $repo"
 
-    clone_args=(
-        --depth 1
-    )
+		clone_args=(clone --depth 1)
 
-    if [ -n "$HP_BRANCH" ]; then
-        clone_args+=(
-            --branch "$HP_BRANCH"
-        )
+		if [ -n "$HP_BRANCH" ]; then
+			clone_args+=(--branch "$HP_BRANCH")
+			log "Requested HomeProxy branch: $HP_BRANCH"
+		else
+			log "HomeProxy branch: repository default"
+		fi
 
-        log "HomeProxy branch override: $HP_BRANCH"
-    else
-        log "HomeProxy branch: repository default"
-    fi
+		clone_args+=("$repo" "$TMP_HP")
 
-    printf '[ZN-HomeProxy] Trying primary upstream: %s\n' \
-        "$PRIMARY_REPO" >&2
+		if ! git "${clone_args[@]}" >/dev/null 2>&1; then
+			warn "Failed to clone: $repo"
+			continue
+		fi
 
-    if git clone \
-        "${clone_args[@]}" \
-        "$PRIMARY_REPO" \
-        "$tmp" \
-        >/dev/null 2>&1
-    then
-        if is_homeproxy_lineage "$tmp"; then
-            mkdir -p "$(dirname "$target")"
-            mv "$tmp" "$target"
+		if ! is_homeproxy_lineage "$TMP_HP"; then
+			warn "Cloned repository does not look like a complete HomeProxy package: $repo"
+			rm -rf -- "$TMP_HP"
+			continue
+		fi
 
-            printf '[ZN-HomeProxy] Using primary HomeProxy source: %s\n' \
-                "$PRIMARY_REPO" >&2
+		target="$TARGET_DIR"
 
-            printf '%s\n' "$target"
-            return 0
-        fi
+		rm -rf -- "$target"
+		mv "$TMP_HP" "$target"
 
-        warn "Primary clone succeeded but is not a complete HomeProxy package."
-        rm -rf -- "$tmp"
-    else
-        warn "Primary HomeProxy source unavailable."
-        rm -rf -- "$tmp"
-    fi
+		if ! is_homeproxy_lineage "$target"; then
+			die "Selected path is not a complete HomeProxy package: $target"
+		fi
 
-    printf '[ZN-HomeProxy] Trying fallback fork: %s\n' \
-        "$FALLBACK_REPO" >&2
+		if ! repo_origin_matches "$target" "$repo"; then
+			warn "Unable to verify git origin after move: $target"
+		fi
 
-    if git clone \
-        "${clone_args[@]}" \
-        "$FALLBACK_REPO" \
-        "$tmp" \
-        >/dev/null 2>&1
-    then
-        if is_homeproxy_lineage "$tmp"; then
-            mkdir -p "$(dirname "$target")"
-            mv "$tmp" "$target"
+		log "Using HomeProxy source: $repo"
+		printf '%s\n' "$target"
+		return 0
+	done
 
-            printf '[ZN-HomeProxy] Using fallback HomeProxy source: %s\n' \
-                "$FALLBACK_REPO" >&2
-
-            printf '%s\n' "$target"
-            return 0
-        fi
-
-        warn "Fallback clone succeeded but is not a complete HomeProxy package."
-        rm -rf -- "$tmp"
-    else
-        warn "Fallback HomeProxy source unavailable."
-        rm -rf -- "$tmp"
-    fi
-
-    die "Both HomeProxy sources are unavailable or incomplete."
+	die "Unable to obtain a valid HomeProxy source from either upstream repository."
 }
 
-
-# ------------------------------------------------------------------
-# 0. Clean any existing HomeProxy source.
-# ------------------------------------------------------------------
-
-remove_existing_homeproxy
-
-
-# ------------------------------------------------------------------
-# 1. Fetch the intended HomeProxy source.
-# ------------------------------------------------------------------
-
-HP_PATH="$(fetch_homeproxy)"
-
-is_homeproxy_lineage "$HP_PATH" || \
-    die "Selected path is not a complete HomeProxy package: $HP_PATH"
-
-HP_ROOT="$HP_PATH/root/etc/homeproxy"
-
-GEN_FILE="$HP_ROOT/scripts/generate_client.uc"
-UPDATE_RESOURCES="$HP_ROOT/scripts/update_resources.sh"
-UPDATE_CROND="$HP_ROOT/scripts/update_crond.sh"
-INIT_FILE="$HP_PATH/root/etc/init.d/homeproxy"
-MAKEFILE="$HP_PATH/Makefile"
-
-log "Selected HomeProxy package: $HP_PATH"
-
-for f in \
-    "$GEN_FILE" \
-    "$UPDATE_RESOURCES" \
-    "$UPDATE_CROND" \
-    "$INIT_FILE" \
-    "$MAKEFILE"
-do
-    [ -f "$f" ] || die "Required file missing: $f"
-done
-
-
-# ------------------------------------------------------------------
-# 2. Upstream sanity checks.
-# ------------------------------------------------------------------
-
-grep -q 'bypass_mainland_china' "$GEN_FILE" || \
-    die "The selected generator has no bypass_mainland_china routing mode."
-
-grep -q 'update_resources\.sh' "$UPDATE_CROND" || \
-    die "update_crond.sh no longer calls update_resources.sh; refusing to alter the upstream workflow."
-
-
-# ------------------------------------------------------------------
-# 3. Bundle the SRS data.
-# ------------------------------------------------------------------
-
-HP_SRS="$HP_PATH/root$HP_SRS_REL"
-
-mkdir -p "$HP_SRS"
+# ---------------------------------------------------------------------------
+# SRS definitions
+# ---------------------------------------------------------------------------
 
 declare -A SRS_URLS=(
-    ["cn.srs"]="https://fastly.jsdelivr.net/gh/1715173329/IPCIDR-CHINA@rule-set/cn.srs"
-    ["geosite-geolocation-cn.srs"]="https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/geosite-geolocation-cn.srs"
-    ["geosite-geolocation-!cn.srs"]="https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/geosite-geolocation-!cn.srs"
-    ["geosite-google.srs"]="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-google.srs"
-    ["geosite-openai.srs"]="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-openai.srs"
-    ["geosite-anthropic.srs"]="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-anthropic.srs"
-    ["geosite-whatsapp.srs"]="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-whatsapp.srs"
-    ["geosite-zoom.srs"]="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-zoom.srs"
+	["cn.srs"]="https://fastly.jsdelivr.net/gh/1715173329/IPCIDR-CHINA@rule-set/cn.srs"
+	["geosite-geolocation-cn.srs"]="https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/geosite-geolocation-cn.srs"
+	["geosite-geolocation-!cn.srs"]="https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/geosite-geolocation-!cn.srs"
+	["geosite-google.srs"]="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-google.srs"
+	["geosite-openai.srs"]="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-openai.srs"
+	["geosite-anthropic.srs"]="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-anthropic.srs"
+	["geosite-whatsapp.srs"]="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-whatsapp.srs"
+	["geosite-zoom.srs"]="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-zoom.srs"
 )
 
-
 download_file() {
-    local url="$1"
-    local out="$2"
+	local url="$1"
+	local output="$2"
+	local tmp="${output}.tmp"
 
-    rm -f -- "$out.tmp"
+	rm -f -- "$tmp"
 
-    if command -v curl >/dev/null 2>&1; then
-        curl \
-            -fL \
-            --retry 3 \
-            --retry-delay 2 \
-            --connect-timeout 15 \
-            --max-time 120 \
-            -o "$out.tmp" \
-            "$url"
+	log "Downloading SRS: $(basename "$output")"
 
-    elif command -v wget >/dev/null 2>&1; then
-        wget \
-            -q \
-            --timeout=20 \
-            --tries=3 \
-            -O "$out.tmp" \
-            "$url"
+	if ! curl \
+		-fL \
+		--retry 3 \
+		--retry-delay 2 \
+		--connect-timeout 20 \
+		--max-time 180 \
+		-sS \
+		"$url" \
+		-o "$tmp"
+	then
+		rm -f -- "$tmp"
+		die "Failed to download: $url"
+	fi
 
-    else
-        echo "[ERROR] Neither curl nor wget is available on the build host." >&2
-        return 1
-    fi
+	[ -s "$tmp" ] ||
+		die "Downloaded SRS is empty: $url"
 
-    [ -s "$out.tmp" ] || {
-        warn "Downloaded file is empty: $url"
-        return 1
-    }
+	# Reject obvious HTTP error pages / HTML responses accidentally saved
+	# with a successful HTTP transport status.
+	if LC_ALL=C head -c 1024 "$tmp" 2>/dev/null |
+		tr '[:upper:]' '[:lower:]' |
+		grep -Eq \
+			'<!doctype[[:space:]]+html|<html([[:space:]>]|$)|<head([[:space:]>]|$)|<body([[:space:]>]|$)|404:[[:space:]]*not[[:space:]]*found|accessdenied|error[[:space:]]*code'
+	then
+		rm -f -- "$tmp"
+		die "Downloaded file appears to be an HTML/error response: $url"
+	fi
 
-    # Reject obvious HTML/text error pages.
-    #
-    # SRS is binary data. This check is intentionally conservative:
-    # it only rejects unmistakable web/error-page signatures.
-    if LC_ALL=C head -c 256 "$out.tmp" |
-        grep -Eiq \
-            '<!doctype html|<html|<head|<body|404:[[:space:]]*not[[:space:]]*found|access denied'
-    then
-        warn "Downloaded response looks like an HTML/text error page: $url"
-        return 1
-    fi
-
-    mv -f "$out.tmp" "$out"
+	mv -f -- "$tmp" "$output"
 }
 
+download_srs() {
+	local name=""
+	local url=""
 
-for FILE in \
-    "cn.srs" \
-    "geosite-geolocation-cn.srs" \
-    "geosite-geolocation-!cn.srs" \
-    "geosite-google.srs" \
-    "geosite-openai.srs" \
-    "geosite-anthropic.srs" \
-    "geosite-whatsapp.srs" \
-    "geosite-zoom.srs"
-do
-    log "SRS: $FILE"
+	mkdir -p "$SRS_DIR"
 
-    download_file \
-        "${SRS_URLS[$FILE]}" \
-        "$HP_SRS/$FILE" || {
-            rm -f -- "$HP_SRS/$FILE.tmp"
-            die "Failed to download SRS: $FILE"
-        }
-done
+	for name in "${!SRS_URLS[@]}"; do
+		url="${SRS_URLS[$name]}"
+		download_file "$url" "$SRS_DIR/$name"
+	done
+}
 
-
-# ------------------------------------------------------------------
-# 4. Replace only the three semantic rule-set objects.
+# ---------------------------------------------------------------------------
+# Replace complete RuleSet objects
 #
-# IMPORTANT:
-#   The entire matching object is replaced.
+# Important:
+#   We do NOT search for:
+#       type: 'remote'
+#       url: ...
+#       download_detour: ...
 #
-# This deliberately does NOT modify an existing object in-place.
-# Therefore no future upstream remote-only attributes can accidentally
-# leak into the local rule-set definition.
-# ------------------------------------------------------------------
+# Instead, we identify the complete push(config.route.rule_set, {...})
+# object by its tag and replace the whole object.
+#
+# This makes the patch tolerant of upstream changes to the implementation
+# of remote/local RuleSets.
+# ---------------------------------------------------------------------------
 
-python3 - "$GEN_FILE" "$GEN_FILE.tmp" "$HP_SRS_REL" <<'PY'
+patch_rulesets() {
+	local script="$TMP_ROOT/patch_rulesets.py"
+
+	cat > "$script" <<'PY'
+#!/usr/bin/env python3
+
 import re
 import sys
 from pathlib import Path
 
-src = Path(sys.argv[1])
-dst = Path(sys.argv[2])
-s = src.read_text()
+hp_dir = Path(sys.argv[1])
+generate = hp_dir / "root/etc/homeproxy/scripts/generate_client.uc"
+
+if not generate.is_file():
+    raise SystemExit(
+        f"generate_client.uc not found: {generate}"
+    )
+
+text = generate.read_text(encoding="utf-8")
 
 targets = {
     "geoip-cn": "cn.srs",
@@ -417,443 +309,489 @@ targets = {
     "geosite-noncn": "geosite-geolocation-!cn.srs",
 }
 
-needle = "push(config.route.rule_set, {"
 
+def find_matching_brace(source, opening):
+    """
+    Find the closing brace corresponding to source[opening] == '{'.
 
-def matching_brace(text, opening):
+    Handles:
+      - single quoted strings
+      - double quoted strings
+      - template-like backtick strings
+      - line comments
+      - block comments
+
+    This is intentionally a small scanner rather than a JavaScript parser.
+    It is sufficient for locating the surrounding object while avoiding
+    braces appearing inside strings/comments.
+    """
+    if opening >= len(source) or source[opening] != "{":
+        raise ValueError("opening position is not '{'")
+
     depth = 0
-    quote = None
-    escape = False
+    i = opening
+    state = "normal"
 
-    for i in range(opening, len(text)):
-        c = text[i]
+    while i < len(source):
+        c = source[i]
+        n = source[i + 1] if i + 1 < len(source) else ""
 
-        if quote:
-            if escape:
-                escape = False
-            elif c == "\\":
-                escape = True
-            elif c == quote:
-                quote = None
-            continue
+        if state == "normal":
+            if c == "'":
+                state = "single"
+            elif c == '"':
+                state = "double"
+            elif c == "`":
+                state = "backtick"
+            elif c == "/" and n == "/":
+                state = "line_comment"
+                i += 1
+            elif c == "/" and n == "*":
+                state = "block_comment"
+                i += 1
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return i
 
-        if c in ("'", '"'):
-            quote = c
-        elif c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
+        elif state == "single":
+            if c == "\\":
+                i += 1
+            elif c == "'":
+                state = "normal"
 
-            if depth == 0:
-                return i
+        elif state == "double":
+            if c == "\\":
+                i += 1
+            elif c == '"':
+                state = "normal"
 
-    return -1
+        elif state == "backtick":
+            if c == "\\":
+                i += 1
+            elif c == "`":
+                state = "normal"
+
+        elif state == "line_comment":
+            if c == "\n":
+                state = "normal"
+
+        elif state == "block_comment":
+            if c == "*" and n == "/":
+                state = "normal"
+                i += 1
+
+        i += 1
+
+    raise ValueError("unmatched '{' in generate_client.uc")
 
 
-def find_rule_objects(text):
+def find_ruleset_objects(source):
+    """
+    Return complete push(config.route.rule_set, {...}) ranges.
+
+    Each result is:
+        (start, closing_brace, full_call_end, body)
+
+    full_call_end includes an optional trailing semicolon.
+    """
+    marker = "push(config.route.rule_set, {"
     pos = 0
+    results = []
 
     while True:
-        start = text.find(needle, pos)
+        start = source.find(marker, pos)
 
         if start < 0:
-            return
+            break
 
-        brace = text.find("{", start)
+        opening = start + marker.rfind("{")
+        closing = find_matching_brace(source, opening)
 
-        if brace < 0:
-            raise SystemExit(
-                "Unable to locate opening brace for rule-set object"
-            )
+        end = closing + 1
 
-        end = matching_brace(text, brace)
+        while end < len(source) and source[end] in " \t":
+            end += 1
 
-        if end < 0:
-            raise SystemExit(
-                "Unbalanced rule-set object in generate_client.uc"
-            )
+        if end < len(source) and source[end] == ";":
+            end += 1
 
-        # Include the object's closing brace, but not the trailing ';'.
-        yield start, end + 1, text[start:end + 1]
+        body = source[opening + 1:closing]
+        results.append((start, closing, end, body))
 
-        pos = end + 1
+        pos = end
 
-
-def detect_indent(obj):
-    match = re.search(
-        r"\n([ \t]+)(?:type|tag|format|path)\s*:",
-        obj
-    )
-
-    if match:
-        return match.group(1)
-
-    return "\t\t"
+    return results
 
 
-objects = list(find_rule_objects(s))
-found = set()
-replacements = []
+def extract_tag(body):
+    patterns = [
+        r"\btag\s*:\s*'([^']+)'",
+        r'\btag\s*:\s*"([^"]+)"',
+    ]
 
-for start, end, obj in objects:
-    tag_match = re.search(
-        r"\btag\s*:\s*['\"]([^'\"]+)['\"]",
-        obj
-    )
+    for pattern in patterns:
+        match = re.search(pattern, body)
+        if match:
+            return match.group(1)
 
-    if not tag_match:
-        continue
+    return None
 
-    tag = tag_match.group(1)
 
-    if tag not in targets:
-        continue
+objects = find_ruleset_objects(text)
 
-    found.add(tag)
+matches = {tag: [] for tag in targets}
 
-    filename = targets[tag]
+for item in objects:
+    tag = extract_tag(item[3])
 
-    indent = detect_indent(obj)
+    if tag in matches:
+        matches[tag].append(item)
 
-    local_obj = (
+
+for tag, found in matches.items():
+    if len(found) == 0:
+        raise SystemExit(
+            f"required RuleSet tag not found: {tag}"
+        )
+
+    if len(found) > 1:
+        raise SystemExit(
+            f"duplicate RuleSet tag found ({len(found)} occurrences): {tag}"
+        )
+
+
+def local_object(tag, filename, indent):
+    return (
         "push(config.route.rule_set, {\n"
         f"{indent}type: 'local',\n"
         f"{indent}tag: '{tag}',\n"
         f"{indent}format: 'binary',\n"
         f"{indent}path: HP_DIR + '/private_srs/{filename}'\n"
-        "});"
+        "})"
     )
 
-    # Replace the entire object including push(...), not just selected
-    # properties. This guarantees that remote-only upstream attributes
-    # cannot survive the transformation.
-    replacements.append(
-        (start, end, local_obj[:-2])  # exclude "});" because source end is "}"
+
+replacements = []
+
+for tag, found in matches.items():
+    start, closing, end, body = found[0]
+
+    # Determine the indentation from the first property of the existing
+    # object. Fall back to four spaces if upstream formatting is unusual.
+    indent = "    "
+
+    lines = body.splitlines()
+
+    for line in lines:
+        if line.strip():
+            leading = line[:len(line) - len(line.lstrip())]
+            if leading:
+                indent = leading
+            break
+
+    replacement = local_object(
+        tag,
+        targets[tag],
+        indent,
     )
 
-# The replacement range currently ends at the object's closing "}".
-# Reconstruct the exact object while preserving the original trailing ';'.
-#
-# Since the original source is:
-#   push(config.route.rule_set, {...});
-#
-# replace the complete range from push(...) through "}" and retain ";".
+    replacements.append((start, end, replacement))
 
-for start, end, new_obj_without_semicolon in reversed(replacements):
-    s = (
-        s[:start]
-        + new_obj_without_semicolon
-        + "}"
-        + s[end:]
-    )
 
-for tag in targets:
-    if tag not in found:
+# Apply from the end of the file backwards so offsets remain valid.
+for start, end, replacement in reversed(replacements):
+    text = text[:start] + replacement + text[end:]
+
+
+generate.write_text(text, encoding="utf-8")
+
+print(
+    "localized RuleSets: "
+    + ", ".join(targets.keys())
+)
+
+
+# ---------------------------------------------------------------------------
+# Strict post-patch validation
+# ---------------------------------------------------------------------------
+
+new_text = generate.read_text(encoding="utf-8")
+new_objects = find_ruleset_objects(new_text)
+
+
+def normalize_body(body):
+    return re.sub(r"\s+", " ", body).strip()
+
+
+for tag, filename in targets.items():
+    found = []
+
+    for item in new_objects:
+        if extract_tag(item[3]) == tag:
+            found.append(item)
+
+    if len(found) != 1:
         raise SystemExit(
-            f"Required built-in rule-set tag not found: {tag}"
+            f"validation failed: expected exactly one RuleSet: {tag}"
         )
 
-dst.write_text(s)
+    body = found[0][3]
+
+    required = [
+        ("type", r"\btype\s*:\s*'local'"),
+        ("tag", rf"\btag\s*:\s*'{re.escape(tag)}'"),
+        ("format", r"\bformat\s*:\s*'binary'"),
+        (
+            "path",
+            rf"\bpath\s*:\s*HP_DIR\s*\+\s*'/private_srs/{re.escape(filename)}'"
+        ),
+    ]
+
+    for name, pattern in required:
+        if not re.search(pattern, body):
+            raise SystemExit(
+                f"validation failed: {tag} missing required property: {name}"
+            )
+
+    forbidden = [
+        r"\btype\s*:\s*'remote'",
+        r"\btype\s*:\s*\"remote\"",
+        r"\burl\s*:",
+        r"\bdownload_detour\s*:",
+        r"\bupdate_interval\s*:",
+    ]
+
+    for pattern in forbidden:
+        if re.search(pattern, body):
+            raise SystemExit(
+                f"validation failed: {tag} still contains forbidden "
+                f"remote property matching: {pattern}"
+            )
+
+    # Only these four properties should remain in the final RuleSet object.
+    property_names = re.findall(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*:",
+        body
+    )
+
+    allowed = {"type", "tag", "format", "path"}
+
+    unexpected = [
+        name for name in property_names
+        if name not in allowed
+    ]
+
+    if unexpected:
+        raise SystemExit(
+            f"validation failed: {tag} contains unexpected properties: "
+            + ", ".join(sorted(set(unexpected)))
+        )
+
+    print(f"[PASS] {tag} -> local {filename}")
+
+
+# Confirm all three objects are still represented as push() calls.
+for tag in targets:
+    pattern = (
+        r"push\s*\(\s*config\.route\.rule_set\s*,\s*\{"
+        r"[^{}]*?"
+        rf"\btag\s*:\s*'{re.escape(tag)}'"
+        r"[^{}]*?"
+        r"\}\s*\)"
+    )
+
+    if not re.search(pattern, new_text, flags=re.S):
+        raise SystemExit(
+            f"validation failed: malformed push() structure for {tag}"
+        )
+
 PY
 
-mv -f "$GEN_FILE.tmp" "$GEN_FILE"
+	chmod +x "$script"
 
+	log "Localizing HomeProxy RuleSets..."
 
-# ------------------------------------------------------------------
-# 5. Strict structural validation.
-#
-# Validation is performed against the actual brace-delimited object,
-# never with grep context ranges.
-# ------------------------------------------------------------------
+	if ! python3 "$script" "$TARGET_DIR"; then
+		die "Failed to localize HomeProxy RuleSets."
+	fi
 
-python3 - "$GEN_FILE" <<'PY'
-import re
-import sys
-from pathlib import Path
-
-s = Path(sys.argv[1]).read_text()
-
-targets = {
-    "geoip-cn": "cn.srs",
-    "geosite-cn": "geosite-geolocation-cn.srs",
-    "geosite-noncn": "geosite-geolocation-!cn.srs",
+	rm -f -- "$script"
 }
 
-needle = "push(config.route.rule_set, {"
-
-
-def matching_brace(text, opening):
-    depth = 0
-    quote = None
-    escape = False
-
-    for i in range(opening, len(text)):
-        c = text[i]
-
-        if quote:
-            if escape:
-                escape = False
-            elif c == "\\":
-                escape = True
-            elif c == quote:
-                quote = None
-            continue
-
-        if c in ("'", '"'):
-            quote = c
-        elif c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-
-            if depth == 0:
-                return i
-
-    return -1
-
-
-found = set()
-pos = 0
-
-while True:
-    start = s.find(needle, pos)
-
-    if start < 0:
-        break
-
-    brace = s.find("{", start)
-
-    if brace < 0:
-        raise SystemExit(
-            "Unable to locate opening brace for rule-set object"
-        )
-
-    end = matching_brace(s, brace)
-
-    if end < 0:
-        raise SystemExit("Unbalanced rule-set object")
-
-    obj = s[start:end + 1]
-
-    tag_match = re.search(
-        r"\btag\s*:\s*['\"]([^'\"]+)['\"]",
-        obj
-    )
-
-    if tag_match:
-        tag = tag_match.group(1)
-
-        if tag in targets:
-            found.add(tag)
-
-            expected_file = targets[tag]
-
-            if re.search(
-                r"\btype\s*:\s*['\"]remote['\"]",
-                obj
-            ):
-                raise SystemExit(
-                    f"{tag} is still remote"
-                )
-
-            if not re.search(
-                r"\btype\s*:\s*['\"]local['\"]",
-                obj
-            ):
-                raise SystemExit(
-                    f"{tag} has no local type"
-                )
-
-            expected_path = (
-                r"HP_DIR\s*\+\s*['\"]"
-                r"/private_srs/"
-                + re.escape(expected_file)
-                + r"['\"]"
-            )
-
-            if not re.search(
-                rf"\bpath\s*:\s*{expected_path}",
-                obj
-            ):
-                raise SystemExit(
-                    f"{tag} has incorrect or missing local path"
-                )
-
-            if re.search(r"\burl\s*:", obj):
-                raise SystemExit(
-                    f"{tag} still contains url"
-                )
-
-            if re.search(r"\bdownload_detour\s*:", obj):
-                raise SystemExit(
-                    f"{tag} still contains download_detour"
-                )
-
-            if re.search(r"\bupdate_interval\s*:", obj):
-                raise SystemExit(
-                    f"{tag} still contains update_interval"
-                )
-
-            properties = re.findall(
-                r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:",
-                obj,
-                flags=re.MULTILINE,
-            )
-
-            allowed = {
-                "type",
-                "tag",
-                "format",
-                "path",
-            }
-
-            unexpected = [
-                prop for prop in properties
-                if prop not in allowed
-            ]
-
-            if unexpected:
-                raise SystemExit(
-                    f"{tag} contains unexpected properties: "
-                    + ", ".join(unexpected)
-                )
-
-            print(
-                f"[PASS] {tag} -> local "
-                f"/etc/homeproxy/private_srs/{expected_file}"
-            )
-
-    pos = end + 1
-
-
-missing = set(targets) - found
-
-if missing:
-    raise SystemExit(
-        "Missing required rule-set tags: "
-        + ", ".join(sorted(missing))
-    )
-PY
-
-
-# ------------------------------------------------------------------
-# 6. Validate all eight SRS files.
-# ------------------------------------------------------------------
-
-for FILE in \
-    "cn.srs" \
-    "geosite-geolocation-cn.srs" \
-    "geosite-geolocation-!cn.srs" \
-    "geosite-google.srs" \
-    "geosite-openai.srs" \
-    "geosite-anthropic.srs" \
-    "geosite-whatsapp.srs" \
-    "geosite-zoom.srs"
-do
-    [ -s "$HP_SRS/$FILE" ] || \
-        die "Required private SRS missing or empty: $FILE"
-done
-
-pass_check "all 8 bundled SRS files are present and non-empty"
-
-
-# ------------------------------------------------------------------
-# 7. Native HomeProxy workflow checks.
-# ------------------------------------------------------------------
-
-if grep -q 'update_resources\.sh' "$UPDATE_CROND"; then
-    pass_check "native update_crond -> update_resources.sh"
-else
-    die "native update_crond -> update_resources.sh is missing"
-fi
-
-
-if grep -q 'bypass_mainland_china' "$GEN_FILE"; then
-    pass_check "upstream bypass_mainland_china routing model preserved"
-else
-    die "upstream bypass_mainland_china routing model missing"
-fi
-
-
-if grep -q 'routing_mode' "$GEN_FILE"; then
-    pass_check "upstream routing_mode handling preserved"
-else
-    die "upstream routing_mode handling missing"
-fi
-
-
-if grep -q 'sing-box' "$GEN_FILE"; then
-    pass_check "upstream sing-box handling preserved"
-else
-    die "upstream sing-box handling missing"
-fi
-
-
-if grep -q 'sing-box version' "$INIT_FILE"; then
-    pass_check "upstream HomeProxy retains runtime sing-box version detection"
-else
-    warn "Could not find literal 'sing-box version' in init script."
-    warn "This is informational only; no sing-box version logic is being added."
-fi
-
-
-# ------------------------------------------------------------------
-# 8. Persist private SRS across sysupgrade.
-# ------------------------------------------------------------------
-
-SYSUPGRADE_CONF="$ROOT/package/base-files/files/etc/sysupgrade.conf"
-
-if [ -d "$ROOT/package/base-files" ]; then
-    mkdir -p "$(dirname "$SYSUPGRADE_CONF")"
-
-    if ! grep -qxF "$HP_SRS_REL/" "$SYSUPGRADE_CONF" 2>/dev/null; then
-        echo "$HP_SRS_REL/" >> "$SYSUPGRADE_CONF"
-        log "Added $HP_SRS_REL/ to sysupgrade.conf"
-    else
-        log "$HP_SRS_REL/ already exists in sysupgrade.conf"
-    fi
-
-    pass_check "sysupgrade persistence configured"
-else
-    warn "base-files package not found; sysupgrade.conf was not modified."
-fi
-
-
-# ------------------------------------------------------------------
-# 9. Final report.
-# ------------------------------------------------------------------
-
-log "=============================================="
-log "ZN-HomeProxy v6 processing complete"
-log "=============================================="
-
-log "HomeProxy source:"
-
-if repo_origin_matches "$HP_PATH" "$PRIMARY_REPO"; then
-    log "  primary : $PRIMARY_REPO"
-elif repo_origin_matches "$HP_PATH" "$FALLBACK_REPO"; then
-    log "  fallback: $FALLBACK_REPO"
-else
-    log "  local/unidentified source: $HP_PATH"
-fi
-
-log "Generator:"
-log "  $GEN_FILE"
-
-log "Private SRS:"
-log "  $HP_SRS"
-
-log "Sysupgrade:"
-log "  $SYSUPGRADE_CONF"
-
-log "Installed SRS:"
-
-find "$HP_SRS" \
-    -maxdepth 1 \
-    -type f \
-    -name '*.srs' \
-    -printf '  %f %s bytes\n' \
-    2>/dev/null |
-    sort || true
-
-log "=============================================="
+# ---------------------------------------------------------------------------
+# Validate required native HomeProxy components
+# ---------------------------------------------------------------------------
+
+validate_homeproxy() {
+	local init_file="$TARGET_DIR/root/etc/init.d/homeproxy"
+	local updater="$TARGET_DIR/root/etc/homeproxy/scripts/update_crond.sh"
+	local generator="$TARGET_DIR/root/etc/homeproxy/scripts/generate_client.uc"
+	local routing_mode=""
+
+	[ -f "$init_file" ] ||
+		die "Missing HomeProxy init script: $init_file"
+
+	[ -f "$updater" ] ||
+		die "Missing native HomeProxy resource updater: $updater"
+
+	[ -f "$generator" ] ||
+		die "Missing HomeProxy generate_client.uc: $generator"
+
+	# Custom Routing must remain native. We only verify its presence; we do
+	# not modify the routing implementation.
+	if grep -Eq 'routing_mode.*custom|custom.*routing_mode' "$generator"; then
+		pass "Custom Routing support detected"
+	else
+		warn "Could not positively detect Custom Routing handling in generate_client.uc"
+	fi
+
+	# Ensure the native resource updater remains available.
+	if grep -Eq 'update_resources|resources' "$updater"; then
+		pass "Native HomeProxy resource updater preserved"
+	else
+		warn "Could not positively detect native resource updater implementation"
+	fi
+
+	# Runtime sing-box compatibility remains owned by upstream HomeProxy.
+	# Do not inject version-specific logic here.
+	if grep -Eq 'sing-box|sing_box|singbox' "$generator"; then
+		pass "Upstream sing-box handling preserved"
+	else
+		warn "Could not positively detect sing-box handling in generate_client.uc"
+	fi
+
+	# Make sure we did not accidentally replace the complete generator with
+	# something unrelated.
+	if ! grep -q 'config.route.rule_set' "$generator"; then
+		die "generate_client.uc does not contain route.rule_set handling"
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# Persist private SRS directory through sysupgrade
+# ---------------------------------------------------------------------------
+
+ensure_sysupgrade_persistence() {
+	local line="/etc/homeproxy/private_srs/"
+	local tmp="${SYSUPGRADE_FILE}.tmp"
+
+	mkdir -p "$(dirname "$SYSUPGRADE_FILE")"
+
+	if [ -f "$SYSUPGRADE_FILE" ] &&
+		grep -Fxq "$line" "$SYSUPGRADE_FILE"
+	then
+		pass "sysupgrade persistence already configured"
+		return 0
+	fi
+
+	if [ -f "$SYSUPGRADE_FILE" ]; then
+		cp -f "$SYSUPGRADE_FILE" "$tmp"
+	else
+		: > "$tmp"
+	fi
+
+	printf '%s\n' "$line" >> "$tmp"
+
+	mv -f "$tmp" "$SYSUPGRADE_FILE"
+
+	pass "Added /etc/homeproxy/private_srs/ to sysupgrade persistence"
+}
+
+# ---------------------------------------------------------------------------
+# Validate SRS files
+# ---------------------------------------------------------------------------
+
+validate_srs() {
+	local name=""
+	local file=""
+	local size=""
+
+	for name in "${!SRS_URLS[@]}"; do
+		file="$SRS_DIR/$name"
+
+		[ -s "$file" ] ||
+			die "Required SRS file missing or empty: $file"
+
+		size="$(wc -c < "$file" | tr -d ' ')"
+
+		log "SRS ready: $name (${size} bytes)"
+	done
+
+	for name in \
+		"cn.srs" \
+		"geosite-geolocation-cn.srs" \
+		"geosite-geolocation-!cn.srs"
+	do
+		file="$SRS_DIR/$name"
+
+		[ -s "$file" ] ||
+			die "Critical local RuleSet is missing: $file"
+	done
+
+	pass "All required SRS files validated"
+}
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+
+cleanup() {
+	rm -rf -- "$TMP_ROOT"
+}
+
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+main() {
+	local HP_PATH=""
+	local name=""
+
+	require_command git
+	require_command curl
+	require_command python3
+
+	log "ZN-HomeProxy V7 starting..."
+	log "Build root: $ROOT"
+
+	remove_existing_homeproxy
+
+	HP_PATH="$(fetch_homeproxy)"
+
+	[ -n "$HP_PATH" ] ||
+		die "HomeProxy source path is empty"
+
+	[ -d "$HP_PATH" ] ||
+		die "Selected HomeProxy path does not exist: $HP_PATH"
+
+	if ! is_homeproxy_lineage "$HP_PATH"; then
+		die "Selected path is not a complete HomeProxy package: $HP_PATH"
+	fi
+
+	log "Selected HomeProxy package: $HP_PATH"
+
+	download_srs
+	validate_srs
+
+	patch_rulesets
+	validate_homeproxy
+
+	ensure_sysupgrade_persistence
+
+	log "Final HomeProxy source: $HP_PATH"
+	log "Final private SRS directory: $SRS_DIR"
+
+	log "Bundled SRS files:"
+	for name in "${!SRS_URLS[@]}"; do
+		printf '  - %s\n' "$name" >&2
+	done
+
+	pass "ZN-HomeProxy V7 completed successfully."
+}
+
+main "$@"
