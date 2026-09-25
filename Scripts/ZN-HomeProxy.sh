@@ -43,7 +43,7 @@ HP_BRANCH="${ZN_HOMEProxy_BRANCH:-}"
 AUTO_FETCH="${ZN_HOMEProxy_AUTO_FETCH:-1}"
 
 log() {
-    printf '[ZN-HomeProxy] %s\n' "$*"
+    printf '[ZN-HomeProxy] %s\n' "$*" >&2
 }
 
 warn() {
