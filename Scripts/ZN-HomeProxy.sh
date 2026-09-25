@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ZN-HomeProxy v3
+# ZN-HomeProxy v4
 #
 # Design:
 #   - szwjp is the primary HomeProxy upstream.
