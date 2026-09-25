@@ -351,7 +351,6 @@ targets = {
     "geosite-noncn": "geosite-geolocation-!cn.srs",
 }
 
-
 def matching_brace(text, opening):
     depth = 0
     quote = None
@@ -359,7 +358,6 @@ def matching_brace(text, opening):
 
     for i in range(opening, len(text)):
         c = text[i]
-
         if quote:
             if escape:
                 escape = False
@@ -375,55 +373,35 @@ def matching_brace(text, opening):
             depth += 1
         elif c == '}':
             depth -= 1
-
             if depth == 0:
                 return i
-
     return -1
-
 
 def find_rule_objects(text):
     needle = "push(config.route.rule_set, {"
     pos = 0
-
     while True:
         start = text.find(needle, pos)
-
         if start < 0:
             return
-
         brace = text.find("{", start)
         end = matching_brace(text, brace)
-
         if end < 0:
-            raise SystemExit(
-                "Unbalanced rule-set object in generate_client.uc"
-            )
-
+            raise SystemExit("Unbalanced rule-set object in generate_client.uc")
         yield start, end + 1, text[start:end + 1]
-
         pos = end + 1
 
-
 s = src.read_text()
-
 objects = list(find_rule_objects(s))
-
 found = set()
 replacements = []
 
-
 for start, end, obj in objects:
-    tag_match = re.search(
-        r"\btag\s*:\s*['\"]([^'\"]+)['\"]",
-        obj
-    )
-
+    tag_match = re.search(r"\btag\s*:\s*['\"]([^'\"]+)['\"]", obj)
     if not tag_match:
         continue
 
     tag = tag_match.group(1)
-
     if tag not in targets:
         continue
 
@@ -431,120 +409,66 @@ for start, end, obj in objects:
 
     if re.search(r"\btype\s*:\s*['\"]local['\"]", obj):
         if not re.search(r"\bpath\s*:", obj):
-            raise SystemExit(
-                f"{tag}: already local but has no path; refusing to guess"
-            )
+            raise SystemExit(f"{tag}: already local but has no path; refusing to guess")
         continue
 
-    if not re.search(r"\btype\s*:\s*['\"]remote['\"]", obj):
-        raise SystemExit(
-            f"{tag}: unsupported rule-set type; refusing to guess"
-        )
+    # 自动探测代码缩进风格
+    indent_match = re.search(r"\n([ \t]+)\b(?:tag|type)\b", obj)
+    indent = indent_match.group(1) if indent_match else "\t\t"
 
     filename = targets[tag]
     local_path = f"HP_DIR + '/private_srs/{filename}'"
 
-    # remote -> local
-    new_obj = re.sub(
-        r"(\btype\s*:\s*)['\"]remote['\"]",
-        r"\1'local'",
-        obj,
-        count=1,
-    )
+    new_obj = obj
 
-    # 灵活移除 url 字段（容忍任意前导空格、行首/非行首及多余逗号与换行）
-    new_obj, n_url = re.subn(
-        r"[ \t]*\burl\s*:\s*['\"][^'\"]+['\"]\s*,?[ \t]*\n?",
-        "",
-        new_obj,
-        count=1,
-    )
+    # 1. 强转 type 为 local
+    new_obj = re.sub(r"(\btype\s*:\s*)['\"]remote['\"]", r"\1'local'", new_obj, count=1)
 
-    if n_url != 1:
-        raise SystemExit(
-            f"{tag}: remote rule-set has no recognizable url field"
-        )
+    # 2. 彻底清洗远端专用属性（兼顾有无引号的情况）
+    new_obj = re.sub(r"[ \t]*\burl\s*:\s*[^,\n\}]+,?[ \t]*\n?", "", new_obj)
+    new_obj = re.sub(r"[ \t]*\bdownload_detour\s*:\s*[^,\n\}]+,?[ \t]*\n?", "", new_obj)
+    new_obj = re.sub(r"[ \t]*\bupdate_interval\s*:\s*[^,\n\}]+,?[ \t]*\n?", "", new_obj)
 
-    # 灵活移除 download_detour 字段
-    new_obj = re.sub(
-        r"[ \t]*\bdownload_detour\s*:\s*[^,\n]+,?[ \t]*\n?",
-        "",
-        new_obj,
-    )
-
-    # 灵活移除 update_interval 字段
-    new_obj = re.sub(
-        r"[ \t]*\bupdate_interval\s*:\s*[^,\n]+,?[ \t]*\n?",
-        "",
-        new_obj,
-    )
-
-    # 补全或替换 local path
+    # 3. 规范插入或替换 path
     if re.search(r"\bpath\s*:", new_obj):
-        new_obj = re.sub(
-            r"(\bpath\s*:\s*)[^,\n]+,?",
-            rf"\1{local_path}",
-            new_obj,
-            count=1,
-        )
+        new_obj = re.sub(r"(\bpath\s*:\s*)[^,\n\}]+", rf"\1{local_path}", new_obj, count=1)
     else:
-        format_match = re.search(
-            r"(?m)^([ \t]*format\s*:\s*[^,\n]+,)[ \t]*\n",
-            new_obj
-        )
+        # 寻找插入锚点：优先 format，其次 type
+        anchor_match = re.search(r"(\bformat\s*:\s*[^,\n\}]+,?)", new_obj)
+        if not anchor_match:
+            anchor_match = re.search(r"(\btype\s*:\s*['\"]local['\"],?)", new_obj)
 
-        if format_match:
-            indent = re.match(r"[ \t]*", format_match.group(1)).group(0)
-            replacement = (
-                format_match.group(1)
-                + "\n"
-                + indent
-                + f"path: {local_path},"
-                + "\n"
-            )
-            new_obj = (
-                new_obj[:format_match.start()]
-                + replacement
-                + new_obj[format_match.end():]
-            )
+        if anchor_match:
+            anchor_str = anchor_match.group(1)
+            fixed_anchor = anchor_str if anchor_str.endswith(",") else anchor_str + ","
+            replacement = f"{fixed_anchor}\n{indent}path: {local_path}"
+            new_obj = new_obj.replace(anchor_str, replacement, 1)
         else:
-            type_match = re.search(
-                r"(?m)^([ \t]*type\s*:\s*['\"]local['\"],)[ \t]*\n",
-                new_obj
-            )
+            raise SystemExit(f"{tag}: cannot determine insertion position for path")
 
-            if not type_match:
-                raise SystemExit(
-                    f"{tag}: cannot determine where to insert local path"
-                )
-
-            indent = re.match(r"[ \t]*", type_match.group(1)).group(0)
-            replacement = (
-                type_match.group(1)
-                + "\n"
-                + indent
-                + f"path: {local_path},"
-                + "\n"
-            )
-            new_obj = (
-                new_obj[:type_match.start()]
-                + replacement
-                + new_obj[type_match.end():]
-            )
+    # 4. 优化 ucode / JS 对象属性的分隔符与多余空行
+    # 确保属性行之间末尾有逗号
+    lines = [l for l in new_obj.splitlines() if l.strip()]
+    formatted_lines = []
+    for idx, line in enumerate(lines):
+        # 如果不是大括号开头/结尾行，且不是最后一行属性，确保结尾有逗号
+        if idx > 0 and idx < len(lines) - 1:
+            if not line.rstrip().endswith(",") and not line.rstrip().endswith("{"):
+                line = line.rstrip() + ","
+        formatted_lines.append(line)
+    
+    new_obj = "\n".join(formatted_lines)
+    # 去除右大括号前的末尾多余逗号
+    new_obj = re.sub(r",(\s*\})", r"\1", new_obj)
 
     replacements.append((start, end, new_obj))
 
-
 for tag in targets:
     if tag not in found:
-        raise SystemExit(
-            f"Required built-in rule-set tag not found: {tag}"
-        )
-
+        raise SystemExit(f"Required built-in rule-set tag not found: {tag}")
 
 for start, end, new_obj in reversed(replacements):
     s = s[:start] + new_obj + s[end:]
-
 
 dst.write_text(s)
 PY
