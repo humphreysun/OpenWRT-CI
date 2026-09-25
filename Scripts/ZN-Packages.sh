@@ -1,6 +1,5 @@
 #!/bin/bash
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2026 VIKINGYFY
+# Scripts/ZN-Packages.sh
 
 #安装和更新软件包
 UPDATE_PACKAGE() {
@@ -104,11 +103,10 @@ DOWNLOAD_FILE() {
 # ============================================================
 
 #echo "[ZN-Packages] Importing VIKINGYFY sing-box..."
-rm -rf ./package/sing-box
+#rm -rf ./package/sing-box
 
 # 删除 feeds 中官方 sing-box，避免重复
-find ./feeds/packages -maxdepth 3 -type d -name "sing-box" \
-    -print -exec rm -rf {} +
+#find ./feeds/packages -maxdepth 3 -type d -name "sing-box"  -print -exec rm -rf {} +
 
 #SINGBOX_PATH="./package/sing-box"
 #SINGBOX_BASE="https://raw.githubusercontent.com/VIKINGYFY/packages/main/sing-box"
@@ -125,9 +123,7 @@ find ./feeds/packages -maxdepth 3 -type d -name "sing-box" \
 
 # 官方 HomeProxy
 #UPDATE_PACKAGE "homeproxy" "immortalwrt/homeproxy" "master"
-
 #UPDATE_PACKAGE "vnt" "lmq8267/luci-app-vnt" "main"
-
 #UPDATE_PACKAGE "diskman" "sbwml/luci-app-diskman" "main"
 #UPDATE_PACKAGE "mosdns" "sbwml/luci-app-mosdns" "v5" "" "v2dat"
 #UPDATE_PACKAGE "openlist2" "sbwml/luci-app-openlist2" "main"
