@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ZN-HomeProxy v2
+# ZN-HomeProxy v3
 #
 # Design:
 #   - szwjp is the primary HomeProxy upstream.
@@ -150,33 +150,48 @@ fetch_homeproxy() {
 
     rm -rf "$tmp"
 
-    log "HomeProxy package not found in build tree."
-    log "Trying primary upstream: $PRIMARY_REPO"
+    # IMPORTANT: fetch_homeproxy is used inside command substitution.
+    # Therefore diagnostic messages must go to stderr; otherwise they become
+    # part of HP_PATH and make the subsequent package validation fail.
+    printf '[ZN-HomeProxy] HomeProxy package not found in build tree.\n' >&2
+    printf '[ZN-HomeProxy] Trying primary upstream: %s\n' "$PRIMARY_REPO" >&2
 
     if git clone --depth 1 --branch "$HP_BRANCH" "$PRIMARY_REPO" "$tmp" >/dev/null 2>&1; then
-        rm -rf "$target"
-        mkdir -p "$(dirname "$target")"
-        mv "$tmp" "$target"
-        log "Using primary HomeProxy source: $PRIMARY_REPO"
-        printf '%s\n' "$target"
-        return 0
+        # Validate the clone BEFORE moving it into the build tree.
+        if is_homeproxy_lineage "$tmp"; then
+            rm -rf "$target"
+            mkdir -p "$(dirname "$target")"
+            mv "$tmp" "$target"
+            printf '[ZN-HomeProxy] Using primary HomeProxy source: %s\n' "$PRIMARY_REPO" >&2
+            printf '%s\n' "$target"
+            return 0
+        fi
+        warn "Primary clone succeeded but is not a complete HomeProxy package; trying fallback."
+        rm -rf "$tmp"
+    else
+        warn "Primary HomeProxy source unavailable."
     fi
 
-    warn "Primary HomeProxy source unavailable."
-    log "Trying fallback fork: $FALLBACK_REPO"
+    printf '[ZN-HomeProxy] Trying fallback fork: %s\n' "$FALLBACK_REPO" >&2
 
     rm -rf "$tmp"
     if git clone --depth 1 --branch "$HP_BRANCH" "$FALLBACK_REPO" "$tmp" >/dev/null 2>&1; then
-        rm -rf "$target"
-        mkdir -p "$(dirname "$target")"
-        mv "$tmp" "$target"
-        log "Using fallback HomeProxy source: $FALLBACK_REPO"
-        printf '%s\n' "$target"
-        return 0
+        # Validate the fallback clone BEFORE moving it into the build tree.
+        if is_homeproxy_lineage "$tmp"; then
+            rm -rf "$target"
+            mkdir -p "$(dirname "$target")"
+            mv "$tmp" "$target"
+            printf '[ZN-HomeProxy] Using fallback HomeProxy source: %s\n' "$FALLBACK_REPO" >&2
+            printf '%s\n' "$target"
+            return 0
+        fi
+        warn "Fallback clone succeeded but is not a complete HomeProxy package."
+    else
+        warn "Fallback HomeProxy source unavailable."
     fi
 
     rm -rf "$tmp"
-    warn "Both HomeProxy sources are unavailable."
+    warn "Both HomeProxy sources are unavailable or incomplete."
     return 1
 }
 
@@ -551,4 +566,4 @@ log "Installed SRS:"
 find "$HP_SRS" -maxdepth 1 -type f -name '*.srs' -printf '  %f %s bytes\n' 2>/dev/null |
     sort || true
 
-echo "=== ZN HomeProxy v2 processing complete ==="
+echo "=== ZN HomeProxy v3 processing complete ==="
