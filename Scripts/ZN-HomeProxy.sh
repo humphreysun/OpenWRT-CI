@@ -1,7 +1,3 @@
-#!/bin/bash
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2026 VIKINGYFY
-#
 # ZN-HomeProxy V7
 #
 # Design:
