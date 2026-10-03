@@ -1,0 +1,78 @@
+name: Auto Sync Upstream & Workflow Mod
+
+on:
+  schedule:
+    - cron: '30 21 * * *'
+  workflow_dispatch:
+
+permissions: write-all
+
+jobs:
+  sync_and_modify:
+    runs-on: ubuntu-latest
+    name: Automated Sync and Strict Workflow Trimming
+    steps:
+    - name: Checkout target repo with PAT
+      uses: actions/checkout@v4
+      with:
+        ref: main
+        token: ${{ secrets.PAT_TOKEN }}
+        persist-credentials: true
+        fetch-depth: 0
+
+    - name: Fetch and Force Sync Upstream
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        
+        mkdir -p /tmp/wf_backup
+        cp -f .github/workflows/Auto-Sync*.yml /tmp/wf_backup/ 2>/dev/null || true
+        cp -f .github/workflows/ZN*.yml /tmp/wf_backup/ 2>/dev/null || true
+        cp -f Config/ZN*.txt /tmp/wf_backup/ 2>/dev/null || true    
+        cp -f Scripts/ZN*.sh /tmp/wf_backup/ 2>/dev/null || true     
+        cp -f Scripts/PRIVATE.sh /tmp/wf_backup/ 2>/dev/null || true    
+        cp -f Scripts/patch_homeproxy.sh /tmp/wf_backup/ 2>/dev/null || true
+        
+        git remote add upstream https://github.com/VIKINGYFY/OpenWRT-CI.git || true
+        git fetch upstream main
+        git reset --hard upstream/main
+
+        mkdir -p .github/workflows Config
+        cp -f /tmp/wf_backup/*.yml .github/workflows/ 2>/dev/null || true
+        cp -f /tmp/wf_backup/*.txt Config/ 2>/dev/null || true
+        cp -f /tmp/wf_backup/*.sh Scripts/ 2>/dev/null || true
+        
+    - name: Force Modify Workflows
+      run: |
+        # ③ 禁用不需要的自动触发
+        [ -f ".github/workflows/MTK-ALL.yml" ] && sed -i '/workflow_run:/,/completed/ {s/^/#/}' .github/workflows/MTK-ALL.yml
+        [ -f ".github/workflows/QCB-ALL.yml" ] && sed -i '/workflow_run:/,/completed/ {s/^/#/}' .github/workflows/QCB-ALL.yml
+
+        # ④ 修改 OWRT-ALL.yml (X86)
+        if [ -f ".github/workflows/OWRT-ALL.yml" ]; then
+          sed -i 's|CONFIG: \[.*\]|CONFIG: \[X86\]|g' .github/workflows/OWRT-ALL.yml
+          sed -i 's|WRT_IP: 192.168.10.1|WRT_IP: 192.168.188.1|g' .github/workflows/OWRT-ALL.yml
+          echo "🎯 OWRT-ALL.yml: Constrained to X86 & IP set to 188.1"
+        fi
+
+        # ⑤ 修改 QCA-ALL.yml (IPQ60XX)
+        if [ -f ".github/workflows/QCA-ALL.yml" ]; then
+          sed -i 's|CONFIG: \[.*\]|CONFIG: \[IPQ60XX-WIFI-NO\]|g' .github/workflows/QCA-ALL.yml
+          sed -i 's|WRT_IP: 192.168.10.1|WRT_IP: 192.168.188.1|g' .github/workflows/QCA-ALL.yml
+          echo "🎯 QCA-ALL.yml: Constrained to IPQ60XX-WIFI-NO & IP set to 188.1"
+        fi
+
+    - name: Rewrite README with Sync Time
+      run: |
+        SYNC_TIME=$(TZ=UTC-8 date "+%Y-%m-%d %H:%M:%S")
+        echo "# ImmortalWRT Auto Build" > README.md
+        echo "" >> README.md
+        echo "Last upstream sync time: **$SYNC_TIME (CST)**" >> README.md
+
+    - name: Push Synced & Modified Changes
+      run: |
+        git add .
+        if [ -n "$(git status --porcelain)" ]; then
+          git commit -m "⚙️ Auto Sync: Workflows trimmed and updated README"
+          git push --force origin main
+        fi
